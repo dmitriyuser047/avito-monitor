@@ -7,6 +7,12 @@ cd "$(dirname "$0")"
 
 say() { printf '\n== %s\n' "$1"; }
 
+# macOS: не давать компьютеру уснуть, пока работает скрипт (блокировка экрана не мешает;
+# закрытая крышка — усыпит, если не подключён внешний монитор)
+if [ "$(uname)" = "Darwin" ]; then
+    caffeinate -is -w $$ &
+fi
+
 # 1. uv — ставит Python нужной версии и все библиотеки
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then

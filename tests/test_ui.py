@@ -89,3 +89,19 @@ def test_city_picker_and_cards():
     s = Subscription(1, "3060", None, None, [], True, "gpu", ["moskva"])
     assert "Москва" in ui.short_sub(s)
     assert "Казань (из настроек)" in ui.sub_card(Subscription(1, "3060", None, None, []), 0)[0]
+
+
+def test_members_access(tmp_path: Path):
+    from avito_bot.bot import TelegramBot
+    db = DB(tmp_path / "a.sqlite3")
+    tg = TelegramBot("123456:TEST-token", db, owner_id=1, city="kazan")
+    assert tg.allowed(1) and not tg.allowed(2)
+    db.add_member(2, "Вася (@vasya)")
+    assert tg.allowed(2) and tg.recipients() == [1, 2]
+    text, kb = ui.access_screen(db.members())
+    assert "Вася" in text and any("Убрать" in b.text for row in kb.inline_keyboard for b in row)
+    owner_menu = [b.text for row in ui.main_menu(paused=False, status="работает", last_ok=None, active=0, total=0,
+                                                   found_today=0, city="Казань", is_owner=True)[1].inline_keyboard for b in row]
+    member_menu = [b.text for row in ui.main_menu(paused=False, status="работает", last_ok=None, active=0, total=0,
+                                                    found_today=0, city="Казань", is_owner=False)[1].inline_keyboard for b in row]
+    assert "Доступ" in owner_menu and "Доступ" not in member_menu

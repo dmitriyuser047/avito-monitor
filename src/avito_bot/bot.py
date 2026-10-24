@@ -1,7 +1,9 @@
 """Telegram-бот: меню, мастер добавления запросов, карточки запросов, уведомления."""
 
+import html
 import logging
 import re
+import secrets
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -23,7 +25,7 @@ from . import ui
 from .config import CITY_NAMES, city_slug
 from .db import DB, Subscription
 from .matcher import Item, parse_add
-from .ui import ItemCb, Nav, SubCb, Wiz
+from .ui import ItemCb, MemberCb, Nav, SubCb, Wiz
 
 log = logging.getLogger(__name__)
 
@@ -99,14 +101,31 @@ class TelegramBot:
 
     # ---------- экраны ----------
 
-    def _menu(self) -> tuple[str, InlineKeyboardMarkup]:
+    def _menu(self, uid: int) -> tuple[str, InlineKeyboardMarkup]:
         subs = self.db.subscriptions()
         mon = self.monitor
         return ui.main_menu(
             paused=mon.paused, status=mon.status, last_ok=mon.last_ok,
             active=sum(s.enabled for s in subs), total=len(subs),
-            found_today=self.db.found_today(), city=self._city_name(),
+            found_today=self.db.found_today(), city=self._city_name(), is_owner=uid == self.owner_id,
         )
+
+    def _access(self) -> tuple[str, InlineKeyboardMarkup]:
+        return ui.access_screen(self.db.members())
+
+    # ---------- кто имеет доступ ----------
+
+    def allowed(self, user_id: int) -> bool:
+        return user_id == self.owner_id or any(uid == user_id for uid, _ in self.db.members())
+
+    def recipients(self) -> list[int]:
+        return ([self.owner_id] if self.owner_id else []) + [uid for uid, _ in self.db.members()]
+
+    async def invite_link(self) -> str:
+        code = secrets.token_urlsafe(9)
+        self.db.create_invite(code)
+        me = await self.bot.get_me()
+        return f"https://t.me/{me.username}?start=inv_{code}"
 
     def _status(self) -> tuple[str, InlineKeyboardMarkup]:
         mon = self.monitor
@@ -160,31 +179,73 @@ class TelegramBot:
         r = Router()
 
         @r.message(Command("start"))
-        async def start(m: Message, state: FSMContext):
+        async def start(m: Message, command: CommandObject, state: FSMContext):
+            user = m.from_user
             if self.owner_id is None:
-                self.owner_id = m.from_user.id
+                self.owner_id = user.id
                 self.db.set("owner_id", str(self.owner_id))
                 log.info("Владелец бота: %s", self.owner_id)
-            if m.from_user.id != self.owner_id:
-                await m.answer("Это личный бот.")
+            arg = (command.args or "").strip()
+            if arg.startswith("inv_") and not self.allowed(user.id):
+                if self.db.use_invite(arg[4:]):
+                    name = user.full_name + (f" (@{user.username})" if user.username else "")
+                    self.db.add_member(user.id, name)
+                    log.info("Новый участник: %s %s", user.id, name)
+                    await m.answer("Доступ получен. Вы будете получать уведомления о новых объявлениях, "
+                                   "а запросы можно смотреть и менять в меню — они общие с владельцем бота.")
+                    try:
+                        await self.bot.send_message(self.owner_id, f"<b>{html.escape(name)}</b> получил доступ к боту.")
+                    except Exception:
+                        pass
+                else:
+                    await m.answer("Ссылка-приглашение недействительна: её уже использовали или прошло больше суток. "
+                                   "Попросите владельца бота прислать новую.")
+                    return
+            if not self.allowed(user.id):
+                await m.answer("Это личный бот. Доступ выдаёт его владелец по ссылке-приглашению.")
                 return
             await state.clear()
-            await self._show(m, self._menu())
+            await self._show(m, self._menu(m.from_user.id))
 
         return r
 
     def _router(self) -> Router:
         r = Router()
-        owner = F.from_user.func(lambda u: u.id == self.owner_id)
-        r.message.filter(owner)
-        r.callback_query.filter(owner)
+        allowed = F.from_user.func(lambda u: self.allowed(u.id))
+        r.message.filter(allowed)
+        r.callback_query.filter(allowed)
+        is_owner = F.from_user.func(lambda u: u.id == self.owner_id)
+
+        # --- доступ (только владелец) ---
+
+        @r.callback_query(Nav.filter(F.to == "access"), is_owner)
+        async def access(c: CallbackQuery):
+            await self._show(c, self._access())
+            await c.answer()
+
+        @r.callback_query(Nav.filter(F.to == "invite"), is_owner)
+        async def invite(c: CallbackQuery):
+            await self._show(c, ui.invite_screen(await self.invite_link()))
+            await c.answer()
+
+        @r.callback_query(MemberCb.filter(), is_owner)
+        async def member_action(c: CallbackQuery, callback_data: MemberCb):
+            if callback_data.action == "remove":
+                name = dict(self.db.members()).get(callback_data.id, "")
+                await self._show(c, ui.remove_member_confirm(callback_data.id, name))
+            elif callback_data.action == "remove_ok":
+                self.db.remove_member(callback_data.id)
+                await c.answer("Доступ убран")
+                await self._show(c, self._access())
+                return
+            await c.answer()
 
         # --- команды ---
 
         @r.message(Command("menu"))
         async def cmd_menu(m: Message, state: FSMContext):
             await state.clear()
-            await self._show(m, self._menu())
+            await self._show(m, self._menu(m.from_user.id))
 
         @r.message(Command("list"))
         async def cmd_list(m: Message, state: FSMContext):
@@ -203,12 +264,12 @@ class TelegramBot:
         @r.message(Command("pause"))
         async def cmd_pause(m: Message):
             self.monitor.set_paused(True)
-            await self._show(m, self._menu())
+            await self._show(m, self._menu(m.from_user.id))
 
         @r.message(Command("resume"))
         async def cmd_resume(m: Message):
             self.monitor.set_paused(False)
-            await self._show(m, self._menu())
+            await self._show(m, self._menu(m.from_user.id))
 
         @r.message(Command("add"))
         async def cmd_add(m: Message, command: CommandObject, state: FSMContext):
@@ -239,10 +300,10 @@ class TelegramBot:
                 await self._send_test(c.from_user.id)
             elif to in ("pause", "resume"):
                 self.monitor.set_paused(to == "pause")
-                await self._show(c, self._menu())
+                await self._show(c, self._menu(c.from_user.id))
             else:
                 await state.clear()
-                await self._show(c, self._menu())
+                await self._show(c, self._menu(c.from_user.id))
             await c.answer()
 
         # --- карточка запроса ---
@@ -341,7 +402,7 @@ class TelegramBot:
             current = await state.get_state()
             if current is None:
                 await c.answer("Этот шаг устарел")
-                await self._show(c, self._menu())
+                await self._show(c, self._menu(c.from_user.id))
                 return
             await state.update_data(msg_id=c.message.message_id)
             edit_id = data.get("edit_id")
@@ -350,7 +411,7 @@ class TelegramBot:
 
             if action == "cancel":
                 await state.clear()
-                await self._show(c, self._card(edit_id) if edit_id else self._menu())
+                await self._show(c, self._card(edit_id) if edit_id else self._menu(c.from_user.id))
             elif action == "cat":
                 category = "" if callback_data.value == "any" else callback_data.value
                 if edit_id and not category and not data.get("query"):
@@ -454,7 +515,7 @@ class TelegramBot:
         # всё прочее — подсказка вместо тишины
         @r.message()
         async def fallback(m: Message):
-            await self._show(m, self._menu())
+            await self._show(m, self._menu(m.from_user.id))
 
         return r
 
@@ -506,32 +567,43 @@ class TelegramBot:
         if not items:
             await self.bot.send_message(chat_id, "Лента ещё не загружена. Попробуйте через несколько секунд.")
             return
-        await self.send_item(items[0], [Subscription(0, "проверка уведомлений", None, None, [])])
+        await self.send_item(items[0], [Subscription(0, "проверка уведомлений", None, None, [])], [chat_id])
 
     async def alert(self, text: str) -> None:
-        log.info("Сообщение владельцу: %s", text)
-        if self.owner_id:
+        log.info("Сообщение всем: %s", text)
+        for chat_id in self.recipients():
             try:
-                await self.bot.send_message(self.owner_id, ui.alert_text(text), reply_markup=ui.alert_keyboard())
+                await self.bot.send_message(chat_id, ui.alert_text(text), reply_markup=ui.alert_keyboard())
             except Exception as e:
-                log.error("Не удалось отправить сообщение: %s", e)
+                log.error("Не удалось отправить сообщение %s: %s", chat_id, e)
 
-    async def send_item(self, item: Item, subs: list[Subscription]) -> None:
-        if not self.owner_id:
-            log.warning("Владелец не задан — отправьте боту /start")
+    async def send_item(self, item: Item, subs: list[Subscription], chat_ids: list[int] | None = None) -> None:
+        chat_ids = chat_ids or self.recipients()
+        if not chat_ids:
+            log.warning("Некому отправлять — напишите боту /start")
             return
         caption = ui.item_caption(item, subs)
         kb = ui.item_keyboard(item, subs)
+        photo = None
         try:
             photo = await self.fetch_image(item.image) if item.image and self.fetch_image else None
-            if photo:
-                await self.bot.send_photo(self.owner_id, BufferedInputFile(photo, f"{item.id}.jpg"),
-                                          caption=caption, reply_markup=kb)
-                return
         except Exception as e:
-            log.warning("Фото не отправилось (%s), шлю текстом", e)
-        await self.bot.send_message(self.owner_id, caption, reply_markup=kb,
-                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
+            log.warning("Фото не скачалось: %s", e)
+        file_id = None  # фото загружаем один раз, остальным отправляем по file_id
+        for chat_id in chat_ids:
+            try:
+                if photo:
+                    msg = await self.bot.send_photo(chat_id, file_id or BufferedInputFile(photo, f"{item.id}.jpg"),
+                                                    caption=caption, reply_markup=kb)
+                    file_id = file_id or msg.photo[-1].file_id
+                    continue
+            except Exception as e:
+                log.warning("Фото не отправилось (%s), шлю текстом", e)
+            try:
+                await self.bot.send_message(chat_id, caption, reply_markup=kb,
+                                            link_preview_options=LinkPreviewOptions(is_disabled=True))
+            except Exception as e:
+                log.error("Не удалось отправить объявление %s: %s", chat_id, e)
 
 
 async def _delete(message: Message | None) -> None:

@@ -55,6 +55,11 @@ class Wiz(CallbackData, prefix="wiz"):
     value: str = ""
 
 
+class MemberCb(CallbackData, prefix="member"):
+    action: str  # remove, remove_ok
+    id: int
+
+
 class ItemCb(CallbackData, prefix="item"):
     action: str  # hide, mute
     sub_id: int = 0
@@ -140,7 +145,7 @@ def short_sub(s: Subscription) -> str:
 # --- экраны ---
 
 def main_menu(*, paused: bool, status: str, last_ok: float | None, active: int, total: int,
-              found_today: int, city: str) -> tuple[str, InlineKeyboardMarkup]:
+              found_today: int, city: str, is_owner: bool = True) -> tuple[str, InlineKeyboardMarkup]:
     state = "на паузе" if paused else status
     text = (
         "<b>Авито-монитор</b>\n"
@@ -157,6 +162,54 @@ def main_menu(*, paused: bool, status: str, last_ok: float | None, active: int, 
         kb.row(_btn("Продолжить слежение", Nav(to="resume"), "success"))
     else:
         kb.row(_btn("Поставить на паузу", Nav(to="pause")))
+    if is_owner:
+        kb.row(_btn("Доступ", Nav(to="access")))
+    return text, kb.as_markup()
+
+
+def access_screen(members: list[tuple[int, str]]) -> tuple[str, InlineKeyboardMarkup]:
+    if members:
+        names = "\n".join(f"— {html.escape(name)}" for _, name in members)
+        text = (
+            "<b>Доступ</b>\n\n"
+            f"Кроме вас ботом пользуются:\n{names}\n\n"
+            "Запросы общие: участники видят и меняют тот же список и получают те же уведомления. "
+            "Выдавать и забирать доступ можете только вы."
+        )
+    else:
+        text = (
+            "<b>Доступ</b>\n\n"
+            "Пока ботом пользуетесь только вы. Пригласите человека — он будет получать те же уведомления "
+            "и сможет менять общий список запросов."
+        )
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn("Пригласить", Nav(to="invite"), "primary"))
+    for uid, name in members:
+        kb.row(_btn(f"Убрать: {name}", MemberCb(action="remove", id=uid)))
+    kb.row(_btn("Назад", Nav(to="menu")))
+    return text, kb.as_markup()
+
+
+def invite_screen(link: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "<b>Приглашение</b>\n\n"
+        "Отправьте эту ссылку человеку. Он откроет её, нажмёт «Запустить» — и получит доступ.\n\n"
+        f"{html.escape(link)}\n\n"
+        "Ссылка одноразовая и действует 24 часа. Когда человек подключится, бот вам напишет."
+    )
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="Скопировать ссылку", copy_text={"text": link}, style="primary"))
+    kb.row(_btn("Назад", Nav(to="access")))
+    return text, kb.as_markup()
+
+
+def remove_member_confirm(uid: int, name: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = f"Забрать доступ у <b>{html.escape(name)}</b>?\n\nУведомления ему больше не будут приходить."
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        _btn("Забрать доступ", MemberCb(action="remove_ok", id=uid), "danger"),
+        _btn("Отмена", Nav(to="access")),
+    )
     return text, kb.as_markup()
 
 

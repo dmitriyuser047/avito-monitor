@@ -40,6 +40,15 @@ class DB:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS members (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                added_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS invites (
+                code TEXT PRIMARY KEY,
+                created_at REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS notifications (
                 item_id INTEGER NOT NULL,
                 sub_id INTEGER NOT NULL,
@@ -133,6 +142,31 @@ class DB:
 
     def found_for(self, sub_id: int) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM notifications WHERE sub_id = ?", (sub_id,)).fetchone()[0]
+
+    # --- участники и приглашения ---
+
+    def members(self) -> list[tuple[int, str]]:
+        return list(self.conn.execute("SELECT user_id, name FROM members ORDER BY added_at"))
+
+    def add_member(self, user_id: int, name: str) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO members VALUES (?, ?, ?)", (user_id, name, time.time()))
+        self.conn.commit()
+
+    def remove_member(self, user_id: int) -> None:
+        self.conn.execute("DELETE FROM members WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+
+    def create_invite(self, code: str) -> None:
+        self.conn.execute("INSERT INTO invites VALUES (?, ?)", (code, time.time()))
+        self.conn.commit()
+
+    def use_invite(self, code: str, ttl_hours: int = 24) -> bool:
+        """Одноразовое приглашение: True, если код действителен (и он тут же гасится)."""
+        cur = self.conn.execute("DELETE FROM invites WHERE code = ? AND created_at > ?",
+                                (code, time.time() - ttl_hours * 3600))
+        self.conn.execute("DELETE FROM invites WHERE created_at <= ?", (time.time() - ttl_hours * 3600,))
+        self.conn.commit()
+        return cur.rowcount > 0
 
     # --- настройки ---
 

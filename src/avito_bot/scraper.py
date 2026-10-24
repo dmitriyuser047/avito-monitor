@@ -85,6 +85,7 @@ class Scraper:
         self.page: Page | None = None
         self._final_url: dict[str, str] = {}  # адрес ленты после редиректа Авито
         self.light_ok = False  # открыта ли страница Авито, из которой можно делать лёгкие запросы
+        self.closed = False  # окно браузера закрыли — работать дальше нельзя
         self.sample_path: Path | None = profile_dir.parent / "feed_sample.html"
 
     async def start(self) -> None:
@@ -108,6 +109,7 @@ class Scraper:
             self.ctx = await self._pw.chromium.launch_persistent_context(
                 str(self.profile_dir), channel="chromium", **options)
         self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
+        self.ctx.on("close", lambda _: setattr(self, "closed", True))
         await self.set_window("minimized")
 
     async def stop(self) -> None:

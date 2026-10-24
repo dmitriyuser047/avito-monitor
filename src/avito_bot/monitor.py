@@ -27,6 +27,10 @@ EMPTY_ALERT_AFTER = 3
 ERROR_ALERT_AFTER = 5
 
 
+class BrowserClosed(Exception):
+    """Окно браузера бота закрыли: процесс завершается, start.sh запускает его заново."""
+
+
 class Monitor:
     def __init__(
         self,
@@ -85,6 +89,7 @@ class Monitor:
                 self.status = "пауза"
                 await asyncio.sleep(2)
                 continue
+            self._check_browser()
             cities = self.cities()
             city = cities[turn % len(cities)]
             turn += 1
@@ -171,6 +176,11 @@ class Monitor:
                 f.write(json.dumps({**asdict(i), "seen_at": time.time(), "categories": sorted(classify(i))},
                                    ensure_ascii=False) + "\n")
 
+    def _check_browser(self) -> None:
+        if self.scraper.closed:
+            log.warning("Окно браузера закрыто — бот перезапустится")
+            raise BrowserClosed()
+
     def set_paused(self, paused: bool) -> None:
         self.paused = paused
         self.db.set("paused", "1" if paused else "0")
@@ -194,6 +204,7 @@ class Monitor:
         next_retry = time.monotonic() + BLOCK_RETRY_MINUTES[0] * 60
         while True:
             await asyncio.sleep(5)
+            self._check_browser()
             status, items = await self.scraper.read_current()
             # не перезагружаем страницу, пока человек решает капчу
             if status is not Status.OK and time.monotonic() >= next_retry and not await self.scraper.captcha_open():

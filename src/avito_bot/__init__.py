@@ -9,7 +9,7 @@ from .config import load_config
 from .db import DB, Subscription
 from .direct_proxy import DirectProxy
 from .matcher import Item
-from .monitor import Monitor
+from .monitor import BrowserClosed, Monitor
 from .scraper import Scraper
 
 log = logging.getLogger("avito_bot")
@@ -50,6 +50,10 @@ async def run() -> None:
         tasks.append(tg.dp.start_polling(tg.bot, handle_signals=False))
     try:
         await asyncio.gather(*tasks)
+    except BrowserClosed:
+        await alert("Окно браузера бота закрыли\nБот перезапустится через 10 секунд. "
+                    "Окно Chrome бота не закрывайте — его можно только свернуть.")
+        raise SystemExit(1)
     finally:
         await scraper.stop()
         if proxy:

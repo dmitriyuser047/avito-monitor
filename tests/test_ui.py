@@ -125,3 +125,13 @@ def test_real_time_in_caption():
     old = Item(2, "x", 1, "", "1 час назад", None, "", "", published=now - 5 * 3600)
     assert not is_fresh(old, now)
     assert is_fresh(Item(3, "x", 1, "", "Вчера", None, "", "", published=now - 600), now)
+
+
+def test_browser_closed_stops_monitor(tmp_path: Path):
+    import pytest
+    from types import SimpleNamespace
+    from avito_bot.config import load_config
+    from avito_bot.monitor import BrowserClosed, Monitor
+    mon = Monitor(load_config(), DB(tmp_path / "c.sqlite3"), SimpleNamespace(closed=True), None, None)
+    with pytest.raises(BrowserClosed):
+        mon._check_browser()

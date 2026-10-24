@@ -20,7 +20,7 @@ from aiogram.types import (
 )
 
 from . import ui
-from .config import CITY_NAMES
+from .config import CITY_NAMES, city_slug
 from .db import DB, Subscription
 from .matcher import Item, parse_add
 from .ui import ItemCb, Nav, SubCb, Wiz
@@ -48,6 +48,7 @@ class Wizard(StatesGroup):
     price = State()
     minus = State()
     confirm = State()
+    city = State()
 
 
 EDIT_STEPS = {
@@ -55,6 +56,7 @@ EDIT_STEPS = {
     "model": Wizard.query,
     "price": Wizard.price,
     "minus": Wizard.minus,
+    "city": Wizard.city,
 }
 
 
@@ -73,13 +75,13 @@ def parse_price(text: str) -> tuple[int | None, int | None] | None:
 
 
 class TelegramBot:
-    def __init__(self, token: str, db: DB, owner_id: int | None, city: str = "", feeds: list[str] | None = None):
+    def __init__(self, token: str, db: DB, owner_id: int | None, city: str = ""):
         self.bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         self.db = db
         stored = db.get("owner_id")
         self.owner_id = owner_id or (int(stored) if stored else None)
         self.city = city
-        self.feeds = feeds or []
+        ui.DEFAULT_CITY = city
         self.monitor = None  # выставляются в __init__.py
         self.fetch_image = None
         self.dp = Dispatcher()
@@ -109,10 +111,12 @@ class TelegramBot:
     def _status(self) -> tuple[str, InlineKeyboardMarkup]:
         mon = self.monitor
         cfg = mon.cfg
-        interval = f"{cfg.poll_interval:g} ± {cfg.poll_jitter:g} с, ночью {cfg.night_interval:g} с"
+        cities = mon.cities()
+        interval = (f"{mon.budget():g} загрузок в минуту, каждый город — раз в ~{mon.city_period():.0f} с\n"
+                    f"Ночью ({cfg.night_hours[0]}:00–{cfg.night_hours[1]}:00) — {cfg.night_requests_per_minute:g} в минуту")
         return ui.status_screen(
             status=mon.status, paused=mon.paused, last_ok=mon.last_ok, cycle=mon.last_cycle_sec,
-            interval=interval, feeds=self.feeds, seen=self.db.seen_count(),
+            interval=interval, feeds=[ui.city_name(c) for c in cities], seen=self.db.seen_count(),
         )
 
     def _card(self, sub_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
@@ -267,7 +271,8 @@ class TelegramBot:
                 await state.clear()
                 await state.set_state(EDIT_STEPS[action])
                 await state.update_data(edit_id=s.id, query=s.query, category=s.category, pmin=s.min_price,
-                                        pmax=s.max_price, minus=s.minus_words, msg_id=c.message.message_id)
+                                        pmax=s.max_price, minus=s.minus_words, cities=s.cities,
+                                        msg_id=c.message.message_id)
                 await self._show(c, self._wizard_screen(EDIT_STEPS[action], await state.get_data()))
             else:
                 await self._show(c, self._card(s.id))
@@ -311,6 +316,18 @@ class TelegramBot:
             await state.update_data(minus=minus)
             await self._goto(m.chat.id, state, Wizard.minus)
 
+        @r.message(Wizard.city, F.text)
+        async def wiz_city_text(m: Message, state: FSMContext):
+            await _delete(m)
+            data = await state.get_data()
+            cities = list(data.get("cities", []))
+            for part in m.text.split(","):
+                slug = city_slug(part)
+                if slug and slug not in cities:
+                    cities.append(slug)
+            await state.update_data(cities=cities)
+            await self._goto(m.chat.id, state, Wizard.city)
+
         @r.message(Wizard.category, F.text)
         @r.message(Wizard.confirm, F.text)
         async def wiz_ignore_text(m: Message):
@@ -344,6 +361,22 @@ class TelegramBot:
                 else:
                     await state.update_data(category=category)
                     await self._goto(chat, state, Wizard.query)
+            elif action == "cities":
+                await self._goto(chat, state, Wizard.city)
+            elif action == "city":
+                cities = list(data.get("cities", []))
+                if callback_data.value in cities:
+                    cities.remove(callback_data.value)
+                else:
+                    cities.append(callback_data.value)
+                await state.update_data(cities=cities)
+                await self._goto(chat, state, Wizard.city)
+            elif action == "citydone":
+                if edit_id:
+                    await self._save_edit(chat, state, cities=data.get("cities", []))
+                    await c.answer("Сохранено")
+                    return
+                await self._goto(chat, state, Wizard.confirm)
             elif action == "anymodel":
                 if edit_id:
                     await self._save_edit(chat, state, query="")
@@ -374,7 +407,8 @@ class TelegramBot:
                 await self._goto(chat, state, Wizard.confirm)
             elif action == "save":
                 sub_id = self.db.add_subscription(data.get("query", ""), data.get("pmin"), data.get("pmax"),
-                                                  data.get("minus", []), data.get("category", ""))
+                                                  data.get("minus", []), data.get("category", ""),
+                                                  data.get("cities", []))
                 await state.clear()
                 await c.answer("Запрос сохранён")
                 await self._show(c, self._card(sub_id))
@@ -389,6 +423,7 @@ class TelegramBot:
                         Wizard.price.state: Wizard.query,
                         Wizard.minus.state: Wizard.price,
                         Wizard.confirm.state: Wizard.minus,
+                        Wizard.city.state: Wizard.confirm,
                     }.get(current)
                     if prev:
                         await self._goto(chat, state, prev)
@@ -436,7 +471,7 @@ class TelegramBot:
         await state.clear()
         await state.set_state(Wizard.category)
         msg = await self._show(event, ui.wiz_category(False))
-        await state.update_data(msg_id=msg.message_id, query="", category="", minus=[])
+        await state.update_data(msg_id=msg.message_id, query="", category="", minus=[], cities=[])
 
     def _wizard_screen(self, step: State, data: dict) -> tuple[str, InlineKeyboardMarkup]:
         edit = bool(data.get("edit_id"))
@@ -449,7 +484,9 @@ class TelegramBot:
             return ui.wiz_price(label, edit)
         if step == Wizard.minus:
             return ui.wiz_minus(label, data.get("minus", []), edit)
-        return ui.wiz_confirm(label, data.get("pmin"), data.get("pmax"), data.get("minus", []))
+        if step == Wizard.city:
+            return ui.city_picker(data.get("cities", []), edit, self.monitor.budget())
+        return ui.wiz_confirm(label, data.get("pmin"), data.get("pmax"), data.get("minus", []), data.get("cities", []))
 
     async def _goto(self, chat_id: int, state: FSMContext, step: State) -> None:
         await state.set_state(step)

@@ -10,7 +10,7 @@ import sys
 
 import httpx
 
-from .config import CITIES, ROOT
+from .config import ROOT, city_slug
 
 ENV = ROOT / ".env"
 EXAMPLE = ROOT / ".env.example"
@@ -30,11 +30,6 @@ def check_token(token: str) -> str | None:
         print(f"  Не удалось связаться с Telegram: {e}")
         return None
     return r["result"]["username"] if r.get("ok") else None
-
-
-def city_slug(text: str) -> str:
-    key = text.strip().lower().replace("ё", "е")
-    return CITIES.get(key, key)
 
 
 def vpn_detected() -> bool:

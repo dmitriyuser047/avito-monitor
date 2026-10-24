@@ -59,3 +59,33 @@ def test_db_migration_and_stats(tmp_path: Path):
     db.record_notification(10, [sid])
     assert db.found_today() == 1 and db.found_for(sid) == 1
     DB(tmp_path / "x.sqlite3")  # повторное открытие не ломает миграцию
+
+
+def test_monitor_cities_and_budget(tmp_path: Path):
+    from avito_bot.config import load_config
+    from avito_bot.monitor import Monitor
+    cfg = load_config()
+    cfg.city, cfg.requests_per_minute, cfg.night_hours = "kazan", 5, (0, 0)
+    db = DB(tmp_path / "m.sqlite3")
+    mon = Monitor(cfg, db, None, None, None)
+    assert mon.cities() == ["kazan"]
+    db.add_subscription("rtx", None, None, [], "", ["moskva", "kazan"])
+    db.add_subscription("ryzen", None, None, [], "", [])
+    off = db.add_subscription("x", None, None, [], "", ["ufa"])
+    db.update_subscription(off, enabled=False)
+    assert mon.cities() == ["kazan", "moskva"]
+    assert mon.city_period() == 24
+    assert mon._slow_down() == 4 and mon.budget() == 4
+    for _ in range(5):
+        mon._slow_down()
+    assert mon.budget() == 2  # не ниже MIN_RPM
+
+
+def test_city_picker_and_cards():
+    ui.DEFAULT_CITY = "kazan"
+    text, kb = ui.city_picker(["moskva", "tula"], False, 5)
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "✓ Москва" in labels and "✓ tula" in labels and "Казань" in labels
+    s = Subscription(1, "3060", None, None, [], True, "gpu", ["moskva"])
+    assert "Москва" in ui.short_sub(s)
+    assert "Казань (из настроек)" in ui.sub_card(Subscription(1, "3060", None, None, []), 0)[0]

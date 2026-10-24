@@ -188,6 +188,7 @@ class Scraper:
 
 def _to_item(r: dict) -> Item:
     href = r["href"].split("?")[0]
+    parts = href.strip("/").split("/")  # kazan/tovary_dlya_kompyutera/videokarta_..._123
     price = r.get("price")
     return Item(
         id=int(r["id"]),
@@ -198,4 +199,6 @@ def _to_item(r: dict) -> Item:
         image=r.get("image"),
         location=r["location"],
         description=r["description"],
+        feed=parts[1] if len(parts) > 2 else "",  # раздел из адреса объявления
+        city=parts[0] if len(parts) > 2 else "",
     )

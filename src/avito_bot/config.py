@@ -15,7 +15,23 @@ CITIES = {
     "пермь": "perm", "волгоград": "volgograd", "краснодар": "krasnodar", "саратов": "saratov",
     "тюмень": "tyumen", "тольятти": "tolyatti", "ижевск": "izhevsk", "набережные челны": "naberezhnye_chelny",
 }
+POPULAR_CITIES = ["moskva", "sankt-peterburg", "kazan", "ekaterinburg", "novosibirsk", "nizhniy_novgorod",
+                  "krasnodar", "samara", "ufa", "rostov-na-donu"]
 CITY_NAMES = {slug: name.title().replace("-На-", "-на-") for name, slug in CITIES.items() if len(name) > 4 and name != "питер"}
+
+
+def feed_url(city: str, feed: str) -> str:
+    return f"https://www.avito.ru/{city}/{feed}?s=104"  # s=104 — сортировка «по дате»
+
+
+def city_slug(text: str) -> str:
+    """«Казань» → kazan; неизвестный город — как написан (ожидаем вид из адреса Авито)."""
+    key = text.strip().lower().replace("ё", "е")
+    return CITIES.get(key, key.replace(" ", "_"))
+
+
+def city_name(slug: str) -> str:
+    return CITY_NAMES.get(slug, slug)
 
 
 def _load_dotenv(path: Path) -> None:
@@ -33,20 +49,19 @@ def _load_dotenv(path: Path) -> None:
 class Config:
     bot_token: str
     owner_id: int | None
-    city: str
-    feeds: list[str]
-    poll_interval: float
-    poll_jitter: float
-    night_interval: float
+    city: str  # город по умолчанию для запросов
+    feed: str  # раздел-лента, одна на город
+    sections: list[str]  # какие разделы из ленты нужны (по адресу объявления)
+    requests_per_minute: float  # бюджет загрузок ленты на этот IP, делится между городами
+    night_requests_per_minute: float
     night_hours: tuple[int, int]
     direct_interface: str | None
     headless: bool
     data_dir: Path = field(default=ROOT / "data")
 
     @property
-    def feed_urls(self) -> list[str]:
-        # s=104 — сортировка «по дате»
-        return [f"https://www.avito.ru/{self.city}/{feed}?s=104" for feed in self.feeds]
+    def feed_url(self) -> str:
+        return feed_url(self.city, self.feed)
 
 
 def load_config() -> Config:
@@ -57,17 +72,11 @@ def load_config() -> Config:
         bot_token=os.environ.get("BOT_TOKEN", ""),
         owner_id=int(owner) if owner else None,
         city=os.environ.get("CITY", "kazan"),
-        feeds=[
-            f.strip()
-            for f in os.environ.get(
-                "FEEDS",
-                "tovary_dlya_kompyutera/komplektuyuschie,nastolnye_kompyutery",
-            ).split(",")
-            if f.strip()
-        ],
-        poll_interval=float(os.environ.get("POLL_INTERVAL", "10")),
-        poll_jitter=float(os.environ.get("POLL_JITTER", "3")),
-        night_interval=float(os.environ.get("NIGHT_INTERVAL", "60")),
+        feed=os.environ.get("FEED", "bytovaya_elektronika").strip(),
+        sections=[s.strip() for s in os.environ.get(
+            "SECTIONS", "tovary_dlya_kompyutera,nastolnye_kompyutery").split(",") if s.strip()],
+        requests_per_minute=float(os.environ.get("REQUESTS_PER_MINUTE", "5")),
+        night_requests_per_minute=float(os.environ.get("NIGHT_REQUESTS_PER_MINUTE", "1")),
         night_hours=(int(night[0]), int(night[1])),
         direct_interface=os.environ.get("DIRECT_INTERFACE", "").strip() or None,
         headless=os.environ.get("HEADLESS", "0") == "1",

@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import datetime
 
-from .config import Config
+from .config import Config, feed_url
 from .db import DB, Subscription
 from .matcher import Item, classify, is_fresh, matches
 from .scraper import Scraper, Status
@@ -21,6 +21,7 @@ from .scraper import Scraper, Status
 log = logging.getLogger(__name__)
 
 BLOCK_RETRY_MINUTES = [15, 30, 60]
+MIN_RPM = 2  # ниже бюджет после блокировок не опускаем
 EMPTY_ALERT_AFTER = 3
 ERROR_ALERT_AFTER = 5
 
@@ -47,30 +48,62 @@ class Monitor:
         self._errors = 0
         self.last_items: list[Item] = []  # для /test
 
-    def interval(self) -> float:
+    # --- бюджет загрузок ---
+
+    def budget(self) -> float:
+        """Сколько загрузок ленты в минуту можно делать сейчас (ночью — меньше)."""
         start, end = self.cfg.night_hours
-        hour = datetime.now().hour
-        base = self.cfg.night_interval if start <= hour < end else self.cfg.poll_interval
-        return max(3.0, base + random.uniform(-self.cfg.poll_jitter, self.cfg.poll_jitter))
+        if start <= datetime.now().hour < end:
+            return self.cfg.night_requests_per_minute
+        learned = self.db.get("rpm")  # снижен после блокировок
+        return min(self.cfg.requests_per_minute, float(learned)) if learned else self.cfg.requests_per_minute
+
+    def delay(self) -> float:
+        base = 60 / max(self.budget(), 0.1)
+        return base * random.uniform(0.8, 1.2)
+
+    def city_period(self) -> float:
+        """Раз в сколько секунд проверяется каждый город."""
+        return len(self.cities()) * 60 / max(self.budget(), 0.1)
+
+    def _slow_down(self) -> float | None:
+        current = float(self.db.get("rpm") or self.cfg.requests_per_minute)
+        lowered = max(MIN_RPM, current - 1)
+        if lowered < current:
+            self.db.set("rpm", f"{lowered:g}")
+            return lowered
+        return None
+
+    # --- опрос ---
 
     async def run(self) -> None:
+        turn = 0
         while True:
             if self.paused:
                 self.status = "пауза"
                 await asyncio.sleep(2)
                 continue
+            cities = self.cities()
+            city = cities[turn % len(cities)]
+            turn += 1
+            url = feed_url(city, self.cfg.feed)
             started = time.monotonic()
-            for feed, url in zip(self.cfg.feeds, self.cfg.feed_urls):
-                status, items = await self.scraper.fetch(url)
-                for item in items:
-                    item.feed = feed
-                if status is Status.BLOCKED:
-                    await self._wait_unblock(url)
-                    break
-                await self._handle(status, items, url)
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+            status, items = await self.scraper.fetch(url)
+            for item in items:
+                item.city = city
+            if status is Status.BLOCKED:
+                await self._wait_unblock(url)
+                continue
+            items = [i for i in items if i.feed in self.cfg.sections]  # только комплектующие и ПК
+            await self._handle(status, items, url)
             self.last_cycle_sec = time.monotonic() - started
-            await asyncio.sleep(self.interval())
+            await asyncio.sleep(self.delay())
+
+    def cities(self) -> list[str]:
+        """Города активных запросов (у запроса без городов — город из настроек)."""
+        subs = self.db.subscriptions(only_enabled=True)
+        cities = {c for s in subs for c in (s.cities or [self.cfg.city])}
+        return sorted(cities, key=lambda c: (c != self.cfg.city, c)) or [self.cfg.city]
 
     async def _handle(self, status: Status, items: list[Item], url: str) -> None:
         if status is Status.OK:
@@ -79,6 +112,12 @@ class Monitor:
             self._empty = self._errors = 0
             self.last_items = items
             self._dump(url, items)
+            if self.db.get(f"feed:{url}") is None:
+                # новая лента (например, запрос в новом городе): то, что уже висит, не присылаем
+                self.db.mark_seen([i.id for i in items])
+                self.db.set(f"feed:{url}", "1")
+                log.info("Новая лента %s: %d объявлений отмечены как просмотренные", url, len(items))
+                return
             await self._process(items)
         elif status is Status.EMPTY:
             self._empty += 1
@@ -101,12 +140,13 @@ class Monitor:
         self._log_items([i for i in items if i.id in new_ids])
         subs = self.db.subscriptions(only_enabled=True)
         for item in items:
+            city_subs = [s for s in subs if item.city in (s.cities or [self.cfg.city])]
             if item.id not in new_ids:
                 continue
             if not is_fresh(item):
                 log.info("Пропуск (не свежее): %s | %s | %s", item.id, item.date, item.title)
                 continue
-            matched = [s for s in subs if matches(item, s)]
+            matched = [s for s in city_subs if matches(item, s)]
             log.info("Новое: %s | %s | %s ₽ | совпадений: %d", item.date, item.title, item.price, len(matched))
             if matched:
                 await self.send_item(item, matched)
@@ -114,7 +154,7 @@ class Monitor:
 
     def _dump(self, url: str, items: list[Item]) -> None:
         """Последняя загруженная лента — для диагностики."""
-        path = self.cfg.data_dir / "feeds" / (url.split("/", 4)[-1].split("?")[0].replace("/", "_") + ".json")
+        path = self.cfg.data_dir / "feeds" / (url.split("/", 3)[-1].split("?")[0].replace("/", "_") + ".json")
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps([asdict(i) for i in items], ensure_ascii=False, indent=1), encoding="utf-8")
 
@@ -132,12 +172,15 @@ class Monitor:
     async def _wait_unblock(self, url: str) -> None:
         self.status = "заблокирован Авито"
         log.warning("Авито ограничил доступ")
+        lowered = self._slow_down()
         await self.scraper.set_window("normal")
         await self.alert(
             "Авито ограничил доступ\n"
             "На компьютере открылось окно браузера: нажмите в нём «Продолжить» и решите капчу — "
             "слежение продолжится само.\n\n"
-            f"Если ничего не делать, бот попробует снова через {BLOCK_RETRY_MINUTES[0]} мин."
+            + (f"Чтобы это повторялось реже, бот снизил частоту до {lowered:g} загрузок в минуту.\n"
+               if lowered else "")
+            + f"Если ничего не делать, бот попробует снова через {BLOCK_RETRY_MINUTES[0]} мин."
         )
         attempt = 0
         next_retry = time.monotonic() + BLOCK_RETRY_MINUTES[0] * 60
@@ -153,5 +196,8 @@ class Monitor:
                 await self.scraper.set_window("minimized")
                 self.status = "работает"
                 await self.alert("Доступ восстановлен\nСлежение продолжается.")
-                await self._handle(status, items, url)
+                city = url.split("/")[3]
+                for item in items:
+                    item.city = city
+                await self._handle(status, [i for i in items if i.feed in self.cfg.sections], url)
                 return

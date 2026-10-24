@@ -2,7 +2,7 @@
 
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +16,7 @@ class Subscription:
     minus_words: list[str]
     enabled: bool = True
     category: str = ""  # ключ раздела из matcher.CATEGORIES; пусто — угадать по словам запроса
+    cities: list[str] = field(default_factory=list)  # как в адресе Авито (kazan); пусто — город из настроек
 
 
 class DB:
@@ -51,15 +52,18 @@ class DB:
             self.conn.execute("ALTER TABLE subscriptions ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
         if "category" not in columns:
             self.conn.execute("ALTER TABLE subscriptions ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        if "city" not in columns:
+            self.conn.execute("ALTER TABLE subscriptions ADD COLUMN city TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
 
     # --- подписки ---
 
     def add_subscription(self, query: str, min_price: int | None, max_price: int | None,
-                         minus_words: list[str], category: str = "") -> int:
+                         minus_words: list[str], category: str = "", cities: list[str] | None = None) -> int:
         cur = self.conn.execute(
-            "INSERT INTO subscriptions (query, min_price, max_price, minus_words, category) VALUES (?, ?, ?, ?, ?)",
-            (query, min_price, max_price, " ".join(minus_words), category),
+            "INSERT INTO subscriptions (query, min_price, max_price, minus_words, category, city)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (query, min_price, max_price, " ".join(minus_words), category, " ".join(cities or [])),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -69,6 +73,8 @@ class DB:
             fields["minus_words"] = " ".join(fields["minus_words"])
         if "enabled" in fields:
             fields["enabled"] = int(fields["enabled"])
+        if "cities" in fields:
+            fields["city"] = " ".join(fields.pop("cities"))  # колонка city: города через пробел
         sets = ", ".join(f"{k} = ?" for k in fields)
         self.conn.execute(f"UPDATE subscriptions SET {sets} WHERE id = ?", (*fields.values(), sub_id))
         self.conn.commit()
@@ -79,14 +85,14 @@ class DB:
         return cur.rowcount > 0
 
     def subscriptions(self, only_enabled: bool = False) -> list[Subscription]:
-        sql = "SELECT id, query, min_price, max_price, minus_words, enabled, category FROM subscriptions"
+        sql = "SELECT id, query, min_price, max_price, minus_words, enabled, category, city FROM subscriptions"
         if only_enabled:
             sql += " WHERE enabled = 1"
         return [_sub(r) for r in self.conn.execute(sql + " ORDER BY id")]
 
     def subscription(self, sub_id: int) -> Subscription | None:
         row = self.conn.execute(
-            "SELECT id, query, min_price, max_price, minus_words, enabled, category FROM subscriptions WHERE id = ?",
+            "SELECT id, query, min_price, max_price, minus_words, enabled, category, city FROM subscriptions WHERE id = ?",
             (sub_id,),
         ).fetchone()
         return _sub(row) if row else None
@@ -140,4 +146,4 @@ class DB:
 
 
 def _sub(r) -> Subscription:
-    return Subscription(r[0], r[1], r[2], r[3], r[4].split(), bool(r[5]), r[6])
+    return Subscription(r[0], r[1], r[2], r[3], r[4].split(), bool(r[5]), r[6], r[7].split())

@@ -34,6 +34,7 @@ class Item:
     location: str
     description: str
     feed: str = ""  # из какой ленты пришло
+    city: str = ""  # город ленты, как в адресе Авито
 
 
 @dataclass(frozen=True)

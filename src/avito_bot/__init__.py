@@ -29,7 +29,7 @@ async def run() -> None:
     await scraper.start()
 
     if cfg.bot_token:
-        tg = TelegramBot(cfg.bot_token, db, cfg.owner_id, cfg.city, cfg.feeds)
+        tg = TelegramBot(cfg.bot_token, db, cfg.owner_id, cfg.city)
         alert, send_item = tg.alert, tg.send_item
     else:
         log.warning("BOT_TOKEN не задан — пробный режим, объявления пишутся в консоль")

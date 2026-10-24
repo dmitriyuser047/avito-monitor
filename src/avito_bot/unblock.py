@@ -22,7 +22,7 @@ async def run() -> None:
     await scraper.start()
     await scraper.set_window("normal")
     try:
-        status, _ = await scraper.fetch(cfg.feed_urls[0])
+        status, _ = await scraper.fetch(cfg.feed_url)
         if status is Status.OK:
             print("Авито открывается без проверки, разблокировка не нужна.")
             return

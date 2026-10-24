@@ -13,7 +13,10 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .db import Subscription
+from .config import POPULAR_CITIES, city_name
 from .matcher import BY_KEY, CATEGORIES, Item, split_query
+
+DEFAULT_CITY = "kazan"  # выставляется ботом из настроек
 
 # Частые минус-слова: (подпись на кнопке, основа слова для поиска в названии)
 MINUS_PRESETS = [
@@ -119,8 +122,16 @@ def category_text(s: Subscription) -> str:
     return f"{cat.name} (по слову в запросе)" if cat else "любой"
 
 
+def cities_text(cities: list[str]) -> str:
+    if not cities:
+        return f"{city_name(DEFAULT_CITY)} (из настроек)"
+    return ", ".join(city_name(c) for c in cities)
+
+
 def short_sub(s: Subscription) -> str:
     text = sub_title(s.query, s.category)
+    if s.cities and s.cities != [DEFAULT_CITY]:
+        text += f" · {cities_text(s.cities)}"
     if s.min_price or s.max_price:
         text += f" · {price_range(s.min_price, s.max_price)}"
     return text if s.enabled else f"{text} · выкл"
@@ -170,6 +181,7 @@ def sub_card(s: Subscription, found: int) -> tuple[str, InlineKeyboardMarkup]:
     text = (
         f"<b>{html.escape(sub_title(s.query, s.category))}</b>\n\n"
         f"Раздел: {html.escape(category_text(s))}\n"
+        f"Города: {html.escape(cities_text(s.cities))}\n"
         f"Модель: {html.escape(s.query) if s.query else 'любая'}\n"
         f"Цена: {price_range(s.min_price, s.max_price)}\n"
         f"Исключить: {html.escape(minus_text(s.minus_words))}\n"
@@ -181,6 +193,7 @@ def sub_card(s: Subscription, found: int) -> tuple[str, InlineKeyboardMarkup]:
         _btn("Раздел", SubCb(action="cat", id=s.id)),
         _btn("Модель", SubCb(action="model", id=s.id)),
     )
+    kb.row(_btn("Города", SubCb(action="city", id=s.id)))
     kb.row(
         _btn("Цена", SubCb(action="price", id=s.id)),
         _btn("Исключения", SubCb(action="minus", id=s.id)),
@@ -206,7 +219,7 @@ def delete_confirm(s: Subscription) -> tuple[str, InlineKeyboardMarkup]:
 
 def status_screen(*, status: str, paused: bool, last_ok: float | None, cycle: float | None,
                   interval: str, feeds: list[str], seen: int) -> tuple[str, InlineKeyboardMarkup]:
-    feeds_text = "\n".join(f"  {html.escape(f)}" for f in feeds)
+    feeds_text = ", ".join(html.escape(f) for f in feeds)
     text = (
         "<b>Состояние</b>\n\n"
         f"Слежение: <b>{'на паузе' if paused else status}</b>\n"
@@ -214,7 +227,7 @@ def status_screen(*, status: str, paused: bool, last_ok: float | None, cycle: fl
         f"Длительность цикла: {f'{cycle:.1f} с' if cycle else '—'}\n"
         f"Интервал опроса: {interval}\n"
         f"Просмотрено объявлений: {money(seen)}\n\n"
-        f"Ленты:\n{feeds_text}"
+        f"Города: {feeds_text}"
     )
     kb = InlineKeyboardBuilder()
     kb.row(_btn("Обновить", Nav(to="status")), _btn("Проверить уведомление", Nav(to="test")))
@@ -304,15 +317,38 @@ def wiz_minus(query: str, minus: list[str], edit: bool) -> tuple[str, InlineKeyb
     return text, kb.as_markup()
 
 
-def wiz_confirm(query: str, pmin: int | None, pmax: int | None, minus: list[str]) -> tuple[str, InlineKeyboardMarkup]:
+def city_picker(selected: list[str], edit: bool, rpm: float) -> tuple[str, InlineKeyboardMarkup]:
+    period = lambda n: f"~{n * 60 / max(rpm, 0.1):.0f} с"
+    text = (
+        ("<b>Изменение запроса</b>\n\n" if edit else "<b>Города</b>\n\n")
+        + "Где искать? Отметьте один или несколько городов. Нужен другой — напишите его название.\n\n"
+        f"Все города делят общий лимит запросов к Авито ({rpm:g} в минуту): один город проверяется "
+        f"раз в {period(1)}, два — каждый раз в {period(2)}, три — раз в {period(3)}. "
+        "Чем больше городов, тем позже приходят уведомления.\n\n"
+        f"Выбрано: {html.escape(cities_text(selected))}"
+    )
+    kb = InlineKeyboardBuilder()
+    for slug in POPULAR_CITIES + [c for c in selected if c not in POPULAR_CITIES]:
+        mark = "✓ " if slug in selected else ""
+        kb.button(text=f"{mark}{city_name(slug)}", callback_data=Wiz(action="city", value=slug).pack())
+    kb.adjust(2)
+    kb.row(_btn("Готово", Wiz(action="citydone"), "primary"))
+    kb.row(_btn("Назад", Wiz(action="back")))
+    return text, kb.as_markup()
+
+
+def wiz_confirm(query: str, pmin: int | None, pmax: int | None, minus: list[str],
+                cities: list[str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
     text = (
         "<b>Проверьте запрос</b>\n\n"
         f"Ищем: <b>{html.escape(query)}</b>\n"
+        f"Города: {html.escape(cities_text(cities or []))}\n"
         f"Цена: {price_range(pmin, pmax)}\n"
         f"Исключить: {html.escape(minus_text(minus))}\n\n"
         "Уведомления будут приходить только о новых объявлениях — тех, что появятся после сохранения."
     )
     kb = InlineKeyboardBuilder()
+    kb.row(_btn("Изменить города", Wiz(action="cities")))
     kb.row(_btn("Сохранить", Wiz(action="save"), "success"))
     kb.row(_btn("Назад", Wiz(action="back")), _btn("Отмена", Wiz(action="cancel")))
     return text, kb.as_markup()
@@ -322,7 +358,8 @@ def wiz_confirm(query: str, pmin: int | None, pmax: int | None, minus: list[str]
 
 def item_caption(item: Item, subs: list[Subscription]) -> str:
     price = f"{money(item.price)} ₽" if item.price is not None else "цена не указана"
-    meta = " · ".join(x for x in (html.escape(item.location), html.escape(item.date)) if x)
+    place = city_name(item.city) if item.city and item.city != DEFAULT_CITY else ""
+    meta = " · ".join(x for x in (html.escape(place), html.escape(item.location), html.escape(item.date)) if x)
     queries = ", ".join(html.escape(sub_title(s.query, s.category)) for s in subs)
     desc = html.escape(item.description[:220]).strip()
     return (

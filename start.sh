@@ -29,11 +29,6 @@ uv run playwright install chromium || { echo "Не удалось установ
 # 3. Настройка при первом запуске
 uv run avito-setup --if-needed || exit 1
 
-# 4. Запуск с автоперезапуском
-trap 'echo; echo "Бот остановлен."; exit 0' INT TERM
-while true; do
-    say "Бот запущен $(date '+%d.%m %H:%M'). Окно не закрывайте; Ctrl+C — остановить."
-    uv run avito-bot
-    echo "Бот остановился (код $?). Перезапуск через 10 секунд…"
-    sleep 10
-done
+# 4. Один общий контроллер с ограниченным числом перезапусков.
+say "Бот запускается. Ctrl+C — остановить."
+exec uv run --no-dev avito-supervise

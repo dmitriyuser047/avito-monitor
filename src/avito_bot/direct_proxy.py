@@ -62,6 +62,7 @@ class DirectProxy:
         if cached and cached[1] > time.monotonic():
             return cached[0]
         r = await self._http.get(DOH_URL, params={"name": name, "type": "A"})
+        r.raise_for_status()
         answers = [a["data"] for a in r.json().get("Answer", []) if a.get("type") == 1]
         if not answers:
             raise OSError(f"DNS: нет A-записи для {name}")
@@ -71,19 +72,25 @@ class DirectProxy:
     async def _open_direct(self, host: str, port: int):
         ip = await self.resolve(host)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if self._source_ip:
-            sock.bind((self._source_ip, 0))
-        elif sys.platform == "darwin":
-            sock.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, self._ifindex)
-        else:
-            sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, self.interface.encode())
-        sock.setblocking(False)
-        await asyncio.get_running_loop().sock_connect(sock, (ip, port))
-        return await asyncio.open_connection(sock=sock)
+        try:
+            if self._source_ip:
+                sock.bind((self._source_ip, 0))
+            elif sys.platform == "darwin":
+                sock.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, self._ifindex)
+            else:
+                sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, self.interface.encode())
+            sock.setblocking(False)
+            await asyncio.wait_for(asyncio.get_running_loop().sock_connect(sock, (ip, port)), 15)
+            return await asyncio.open_connection(sock=sock)
+        except BaseException:
+            sock.close()
+            raise
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        up_writer = None
+        connected = False
         try:
-            head = await reader.readuntil(b"\r\n\r\n")
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
             method, target, _ = head.split(b"\r\n", 1)[0].decode().split(" ", 2)
             if method != "CONNECT":
                 writer.write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
@@ -91,15 +98,22 @@ class DirectProxy:
                 return
             host, port = target.rsplit(":", 1)
             up_reader, up_writer = await self._open_direct(host, int(port))
-        except Exception as e:
-            log.debug("Прокси: ошибка подключения: %s", e)
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            await writer.drain()
+            connected = True
+            await asyncio.gather(_pipe(reader, up_writer), _pipe(up_reader, writer))
+        except Exception as exc:
+            log.debug("Proxy connection failed: %s", type(exc).__name__)
+            if not connected and not writer.is_closing():
+                try:
+                    writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    await writer.drain()
+                except ConnectionError:
+                    pass
+        finally:
             await _close(writer)
-            return
-
-        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        await writer.drain()
-        await asyncio.gather(_pipe(reader, up_writer), _pipe(up_reader, writer))
+            if up_writer:
+                await _close(up_writer)
 
 
 async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

@@ -7,6 +7,7 @@
 import ipaddress
 import socket
 import sys
+import sqlite3
 
 import httpx
 
@@ -99,6 +100,19 @@ def run() -> None:
     city = city_slug(ask("   Город", "kazan"))
     print(f"   Проверить: https://www.avito.ru/{city}/tovary_dlya_kompyutera\n")
 
+    owner = ''
+    database = ROOT / 'data' / 'bot.sqlite3'
+    if database.exists():
+        with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='owner_id'").fetchone()
+            owner = row[0] if row else ''
+    print('Укажите свой числовой Telegram ID. Только этот пользователь станет владельцем бота.')
+    while True:
+        owner = ask('   Telegram ID владельца', owner)
+        if owner.isdigit() and int(owner) > 0:
+            break
+        print('   Нужен положительный числовой ID, не @username.')
+
     direct = ""
     print("3. Проверка сети.")
     print(f"   Внешний IP: {public_ip_info()}")
@@ -115,9 +129,9 @@ def run() -> None:
         print("   VPN не обнаружен, обход не нужен.")
         print("   Важно: Авито пускает только домашний российский IP. На VPS и через VPN работать не будет.")
 
-    write_env({"BOT_TOKEN": token, "OWNER_ID": "", "CITY": city, "DIRECT_INTERFACE": direct})
+    write_env({"BOT_TOKEN": token, "OWNER_ID": owner, "CITY": city, "DIRECT_INTERFACE": direct})
     print(f"\nГотово, настройки сохранены в {ENV.name}.")
-    print(f"Теперь напишите боту @{name} команду /start — вы станете его владельцем.\n")
+    print(f"Теперь напишите боту @{name} команду /start.\n")
 
 
 def main() -> None:

@@ -8,7 +8,7 @@ import secrets
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -35,11 +35,12 @@ COMMANDS = [
     BotCommand(command="list", description="Мои запросы"),
     BotCommand(command="status", description="Состояние бота"),
     BotCommand(command="test", description="Проверить уведомление"),
+    BotCommand(command="health", description="Источник и очередь доставки"),
+    BotCommand(command="unblock", description="Открыть проверку Авито вручную"),
 ]
 DESCRIPTION = (
-    "Присылаю новые объявления Авито о комплектующих и компьютерах через несколько секунд "
-    "после публикации. Добавьте модель, которую ищете, — например 1660 super, — и я напишу, "
-    "как только она появится."
+    "Проверяю новые объявления Авито о комплектующих и компьютерах и отправляю подходящие в Telegram. "
+    "Добавьте модель, которую ищете, — например 1660 super, — цену и города поиска."
 )
 SHORT_DESCRIPTION = "Новые объявления Авито о комплектующих и ПК — сразу в Telegram."
 
@@ -182,9 +183,8 @@ class TelegramBot:
         async def start(m: Message, command: CommandObject, state: FSMContext):
             user = m.from_user
             if self.owner_id is None:
-                self.owner_id = user.id
-                self.db.set("owner_id", str(self.owner_id))
-                log.info("Владелец бота: %s", self.owner_id)
+                await m.answer("Владелец ещё не задан. Укажите OWNER_ID в настройках на компьютере бота.")
+                return
             arg = (command.args or "").strip()
             if arg.startswith("inv_") and not self.allowed(user.id):
                 if self.db.use_invite(arg[4:]):
@@ -257,16 +257,30 @@ class TelegramBot:
             await state.clear()
             await self._show(m, self._status())
 
+        @r.message(Command("health"))
+        async def cmd_health(m: Message):
+            await m.answer(self.monitor.health_text())
+
+        @r.message(Command("unblock"), is_owner)
+        async def cmd_unblock(m: Message):
+            try:
+                await m.answer(await self.monitor.open_verification())
+            except Exception:
+                await m.answer("Браузер недоступен. Проверьте /health и перезапустите бот на компьютере.")
+
         @r.message(Command("test"))
         async def cmd_test(m: Message):
-            await self._send_test(m.chat.id)
+            try:
+                await self._send_test(m.chat.id)
+            except Exception as exc:
+                log.warning("Test notification failed: %s", type(exc).__name__)
 
         @r.message(Command("pause"))
         async def cmd_pause(m: Message):
             self.monitor.set_paused(True)
             await self._show(m, self._menu(m.from_user.id))
 
-        @r.message(Command("resume"))
+        @r.message(Command("resume"), is_owner)
         async def cmd_resume(m: Message):
             self.monitor.set_paused(False)
             await self._show(m, self._menu(m.from_user.id))
@@ -299,6 +313,9 @@ class TelegramBot:
             elif to == "test":
                 await self._send_test(c.from_user.id)
             elif to in ("pause", "resume"):
+                if to == "resume" and c.from_user.id != self.owner_id:
+                    await c.answer("Возобновить опрос может владелец", show_alert=True)
+                    return
                 self.monitor.set_paused(to == "pause")
                 await self._show(c, self._menu(c.from_user.id))
             else:
@@ -570,18 +587,19 @@ class TelegramBot:
         await self.send_item(items[0], [Subscription(0, "проверка уведомлений", None, None, [])], [chat_id])
 
     async def alert(self, text: str) -> None:
-        log.info("Сообщение всем: %s", text)
-        for chat_id in self.recipients():
+        log.info("Сообщение владельцу: %s", text)
+        for chat_id in ([self.owner_id] if self.owner_id else []):
             try:
                 await self.bot.send_message(chat_id, ui.alert_text(text), reply_markup=ui.alert_keyboard())
             except Exception as e:
                 log.error("Не удалось отправить сообщение %s: %s", chat_id, e)
 
     async def send_item(self, item: Item, subs: list[Subscription], chat_ids: list[int] | None = None) -> None:
-        chat_ids = chat_ids or self.recipients()
-        if not chat_ids:
-            log.warning("Некому отправлять — напишите боту /start")
-            return
+        for chat_id in (self.recipients() if chat_ids is None else chat_ids):
+            await self.send_to_chat(item, subs, chat_id)
+
+    async def send_to_chat(self, item: Item, subs: list[Subscription], chat_id: int) -> None:
+        """Success means Telegram accepted the photo or text; errors reach the outbox worker."""
         caption = ui.item_caption(item, subs)
         kb = ui.item_keyboard(item, subs)
         photo = None
@@ -589,21 +607,17 @@ class TelegramBot:
             photo = await self.fetch_image(item.image) if item.image and self.fetch_image else None
         except Exception as e:
             log.warning("Фото не скачалось: %s", e)
-        file_id = None  # фото загружаем один раз, остальным отправляем по file_id
-        for chat_id in chat_ids:
+        if photo:
             try:
-                if photo:
-                    msg = await self.bot.send_photo(chat_id, file_id or BufferedInputFile(photo, f"{item.id}.jpg"),
-                                                    caption=caption, reply_markup=kb)
-                    file_id = file_id or msg.photo[-1].file_id
-                    continue
-            except Exception as e:
-                log.warning("Фото не отправилось (%s), шлю текстом", e)
-            try:
-                await self.bot.send_message(chat_id, caption, reply_markup=kb,
-                                            link_preview_options=LinkPreviewOptions(is_disabled=True))
-            except Exception as e:
-                log.error("Не удалось отправить объявление %s: %s", chat_id, e)
+                await self.bot.send_photo(chat_id, BufferedInputFile(photo, f"{item.id}.jpg"),
+                                          caption=caption, reply_markup=kb)
+                return
+            except (TelegramRetryAfter, TelegramForbiddenError):
+                raise
+            except Exception as exc:
+                log.warning("Photo failed, trying text: %s", type(exc).__name__)
+        await self.bot.send_message(chat_id, caption, reply_markup=kb,
+                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
 async def _delete(message: Message | None) -> None:

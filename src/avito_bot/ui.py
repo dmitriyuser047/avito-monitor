@@ -434,13 +434,22 @@ def wiz_confirm(query: str, pmin: int | None, pmax: int | None, minus: list[str]
 # --- уведомление об объявлении ---
 
 def item_caption(item: Item, subs: list[Subscription]) -> str:
+    def escaped(text: str, budget: int) -> str:
+        parts, size = [], 0
+        for char in text:
+            value = html.escape(char)
+            if size + len(value) > budget - 1:
+                return ''.join(parts) + '…'
+            parts.append(value)
+            size += len(value)
+        return ''.join(parts)
     price = f"{money(item.price)} ₽" if item.price is not None else "цена не указана"
     place = city_name(item.city) if item.city and item.city != DEFAULT_CITY else ""
-    meta = " · ".join(x for x in (html.escape(place), html.escape(item.location)) if x)
-    queries = ", ".join(html.escape(sub_title(s.query, s.category)) for s in subs)
-    desc = html.escape(item.description[:220]).strip()
+    meta = escaped(' · '.join(x for x in (place, item.location) if x), 100)
+    queries = escaped(', '.join(sub_title(s.query, s.category) for s in subs), 180)
+    desc = escaped(item.description[:220], 260).strip()
     return (
-        f"<b>{html.escape(item.title)}</b>\n"
+        f"<b>{escaped(item.title, 240)}</b>\n"
         f"<b>{price}</b>\n"
         + (f"{meta}\n" if meta else "")
         + f"{when_text(item)}\n"

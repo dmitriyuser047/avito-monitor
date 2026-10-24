@@ -24,13 +24,10 @@ if errorlevel 1 goto fail
 uv run avito-setup --if-needed
 if errorlevel 1 goto fail
 
-:loop
 echo.
-echo == Бот запущен %date% %time:~0,5%. Окно не закрывайте.
-uv run avito-bot
-echo Бот остановился. Перезапуск через 10 секунд...
-timeout /t 10 /nobreak >nul
-goto loop
+echo == Бот запускается. Для остановки закройте окно.
+uv run --no-dev avito-supervise
+exit /b %errorlevel%
 
 :fail
 echo.

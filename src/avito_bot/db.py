@@ -1,5 +1,6 @@
 """SQLite: подписки, уже виденные объявления, отправленные уведомления, настройки."""
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -23,6 +24,9 @@ class DB:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -53,6 +57,50 @@ class DB:
                 item_id INTEGER NOT NULL,
                 sub_id INTEGER NOT NULL,
                 sent_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS items (
+                item_id INTEGER PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                first_seen_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                id INTEGER PRIMARY KEY,
+                item_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                lease_until REAL,
+                sent_at REAL,
+                last_error TEXT,
+                UNIQUE(item_id, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbox_pending
+                ON notification_outbox(status, next_attempt_at);
+            CREATE INDEX IF NOT EXISTS idx_notifications_item_sub ON notifications(item_id, sub_id);
+            CREATE TABLE IF NOT EXISTS source_state (
+                source_id TEXT NOT NULL,
+                city TEXT NOT NULL,
+                state TEXT NOT NULL,
+                next_allowed_at REAL,
+                reason TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(source_id, city)
+            );
+            CREATE TABLE IF NOT EXISTS fetch_metrics (
+                id INTEGER PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                city TEXT NOT NULL,
+                fetched_at REAL NOT NULL,
+                status TEXT NOT NULL,
+                http_status INTEGER,
+                raw_count INTEGER NOT NULL,
+                matched_count INTEGER NOT NULL,
+                overlap_count INTEGER,
+                interval_sec REAL,
+                cooldown_until REAL,
+                item_ids_json TEXT NOT NULL
             );
             """
         )
@@ -141,7 +189,110 @@ class DB:
         ).fetchone()[0]
 
     def found_for(self, sub_id: int) -> int:
-        return self.conn.execute("SELECT COUNT(*) FROM notifications WHERE sub_id = ?", (sub_id,)).fetchone()[0]
+        return self.conn.execute("SELECT COUNT(DISTINCT item_id) FROM notifications WHERE sub_id = ?", (sub_id,)).fetchone()[0]
+
+    # Событие и задания каждому получателю фиксируются одной транзакцией.
+    def stage_items(self, entries: list[tuple[int, dict, list[int]]], now: float) -> list[int]:
+        inserted = []
+        with self.conn:
+            for item_id, payload, chat_ids in entries:
+                cur = self.conn.execute("INSERT OR IGNORE INTO seen VALUES (?, ?)", (item_id, now))
+                if not cur.rowcount:
+                    continue
+                encoded = json.dumps(payload, ensure_ascii=False)
+                self.conn.execute("INSERT OR REPLACE INTO items VALUES (?, ?, ?)", (item_id, encoded, now))
+                for chat_id in set(chat_ids):
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO notification_outbox"
+                        " (item_id, chat_id, payload_json, next_attempt_at) VALUES (?, ?, ?, ?)",
+                        (item_id, chat_id, encoded, now))
+                inserted.append(item_id)
+        return inserted
+
+    def claim_delivery(self, now: float, lease_seconds: float = 120) -> dict | None:
+        with self.conn:
+            self.conn.execute("UPDATE notification_outbox SET status='retry', lease_until=NULL"
+                              " WHERE status='leased' AND lease_until <= ?", (now,))
+            row = self.conn.execute(
+                "UPDATE notification_outbox SET status='leased', attempts=attempts+1, lease_until=?"
+                " WHERE id=(SELECT id FROM notification_outbox WHERE status IN ('pending','retry')"
+                " AND next_attempt_at <= ? ORDER BY next_attempt_at,id LIMIT 1) RETURNING *",
+                (now + lease_seconds, now))
+            names = [c[0] for c in row.description]
+            values = row.fetchone()
+        return dict(zip(names, values)) if values else None
+
+    def ack_delivery(self, job_id: int, now: float) -> None:
+        with self.conn:
+            row = self.conn.execute("SELECT item_id,payload_json FROM notification_outbox"
+                                    " WHERE id=? AND status='leased'", (job_id,)).fetchone()
+            if not row:
+                return
+            self.conn.execute("UPDATE notification_outbox SET status='sent',sent_at=?,lease_until=NULL,"
+                              "last_error=NULL WHERE id=?", (now, job_id))
+            for sub in json.loads(row[1])["subs"]:
+                self.conn.execute("INSERT INTO notifications SELECT ?,?,? WHERE NOT EXISTS"
+                                  " (SELECT 1 FROM notifications WHERE item_id=? AND sub_id=?)",
+                                  (row[0], sub["id"], now, row[0], sub["id"]))
+
+    def fail_delivery(self, job_id: int, error: str, next_at: float, terminal: bool = False) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE notification_outbox SET status=?,last_error=?,next_attempt_at=?,"
+                              "lease_until=NULL WHERE id=? AND status='leased'",
+                              ('terminal' if terminal else 'retry', error[:300], next_at, job_id))
+
+    def queue_counts(self) -> dict[str, int]:
+        return dict(self.conn.execute("SELECT status,COUNT(*) FROM notification_outbox GROUP BY status"))
+
+    def source_states(self, source_id: str) -> list[dict]:
+        cur = self.conn.execute("SELECT city,state,next_allowed_at,reason,updated_at FROM source_state"
+                                " WHERE source_id=? ORDER BY city", (source_id,))
+        names = [c[0] for c in cur.description]
+        return [dict(zip(names, row)) for row in cur]
+
+    def save_source_state(self, source_id: str, city: str, state: str,
+                          next_allowed_at: float | None = None, reason: str = '') -> bool:
+        old = self.conn.execute("SELECT state FROM source_state WHERE source_id=? AND city=?",
+                                (source_id, city)).fetchone()
+        with self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO source_state VALUES (?,?,?,?,?,?)",
+                              (source_id, city, state, next_allowed_at, reason, time.time()))
+        return not old or old[0] != state
+
+    def latest_snapshot(self, source_id: str, city: str) -> tuple[set[int], float] | None:
+        row = self.conn.execute("SELECT item_ids_json,fetched_at FROM fetch_metrics"
+                                " WHERE source_id=? AND city=? AND status IN ('ok','no_results')"
+                                " ORDER BY id DESC LIMIT 1", (source_id, city)).fetchone()
+        return (set(json.loads(row[0])), row[1]) if row else None
+
+    def record_fetch(self, **values) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO fetch_metrics (source_id,city,fetched_at,status,http_status,"
+                              "raw_count,matched_count,overlap_count,interval_sec,cooldown_until,item_ids_json)"
+                              " VALUES (:source_id,:city,:fetched_at,:status,:http_status,:raw_count,"
+                              ":matched_count,:overlap_count,:interval_sec,:cooldown_until,:item_ids_json)", values)
+
+    def latency_stats(self) -> dict:
+        rows = self.conn.execute("SELECT o.sent_at,i.first_seen_at,i.payload_json FROM notification_outbox o"
+                                 " JOIN items i USING(item_id) WHERE o.status='sent' ORDER BY o.id DESC LIMIT 5000")
+        delivery, publish = [], []
+        for sent, seen, payload in rows:
+            delivery.append(max(0, sent - seen))
+            pub = json.loads(payload)['item'].get('published')
+            if pub:
+                publish.append(max(0, sent - pub))
+        def summary(samples):
+            samples.sort()
+            if not samples:
+                return None
+            import math
+            return {'n': len(samples), 'p50': samples[math.ceil(len(samples)*.5)-1],
+                    'p95': samples[math.ceil(len(samples)*.95)-1],
+                    'within_60': sum(s <= 60 for s in samples) / len(samples)}
+        return {'delivery': summary(delivery), 'publish': summary(publish)}
+
+    def close(self) -> None:
+        self.conn.close()
 
     # --- участники и приглашения ---
 

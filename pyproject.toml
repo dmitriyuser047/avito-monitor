@@ -14,6 +14,9 @@ dependencies = [
 avito-bot = "avito_bot:main"
 avito-setup = "avito_bot.setup_wizard:main"
 avito-unblock = "avito_bot.unblock:main"
+avito-supervise = "avito_bot.supervisor:main"
+avito-service = "avito_bot.service:main"
+avito-metrics = "avito_bot.metrics:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]

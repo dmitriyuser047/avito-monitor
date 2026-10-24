@@ -1,6 +1,7 @@
 """Настройки из .env (или переменных окружения)."""
 
 import os
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -58,6 +59,9 @@ class Config:
     direct_interface: str | None
     headless: bool
     data_dir: Path = field(default=ROOT / "data")
+    save_debug_html: bool = False
+    debug_html_retention_hours: float = 24
+    cooldown_seconds: float = 900
 
     @property
     def feed_url(self) -> str:
@@ -68,16 +72,28 @@ def load_config() -> Config:
     _load_dotenv(ROOT / ".env")
     night = os.environ.get("NIGHT_HOURS", "2-7").split("-")
     owner = os.environ.get("OWNER_ID", "").strip()
-    return Config(
+    cfg = Config(
         bot_token=os.environ.get("BOT_TOKEN", ""),
         owner_id=int(owner) if owner else None,
         city=os.environ.get("CITY", "kazan"),
         feed=os.environ.get("FEED", "bytovaya_elektronika").strip(),
         sections=[s.strip() for s in os.environ.get(
             "SECTIONS", "tovary_dlya_kompyutera,nastolnye_kompyutery").split(",") if s.strip()],
-        requests_per_minute=float(os.environ.get("REQUESTS_PER_MINUTE", "5")),
+        requests_per_minute=float(os.environ.get("REQUESTS_PER_MINUTE", "1")),
         night_requests_per_minute=float(os.environ.get("NIGHT_REQUESTS_PER_MINUTE", "1")),
         night_hours=(int(night[0]), int(night[1])),
         direct_interface=os.environ.get("DIRECT_INTERFACE", "").strip() or None,
         headless=os.environ.get("HEADLESS", "0") == "1",
+        save_debug_html=os.environ.get("SAVE_DEBUG_HTML", "0") == "1",
+        debug_html_retention_hours=float(os.environ.get("DEBUG_HTML_RETENTION_HOURS", "24")),
+        cooldown_seconds=float(os.environ.get("COOLDOWN_SECONDS", "900")),
     )
+    for name in ('requests_per_minute', 'night_requests_per_minute', 'cooldown_seconds', 'debug_html_retention_hours'):
+        value = getattr(cfg, name)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f'{name} must be a positive finite number')
+    if any(h < 0 or h > 23 for h in cfg.night_hours):
+        raise ValueError('NIGHT_HOURS must contain hours 0–23')
+    if cfg.owner_id is not None and cfg.owner_id <= 0:
+        raise ValueError('OWNER_ID must be positive')
+    return cfg

@@ -1,49 +1,65 @@
-"""Разблокировка вручную: открыть окно браузера бота на Авито и дождаться, пока человек решит капчу.
-
-Запуск (бот в это время должен быть остановлен): uv run avito-unblock
-"""
-
+"""Explicit manual verification using the saved profile; never runs beside the bot."""
 import asyncio
 import logging
+import time
 
 from .config import load_config
+from .db import DB
 from .direct_proxy import DirectProxy
-from .scraper import Scraper, Status
-
-WAIT_MINUTES = 15
+from .runtime import InstanceLock
+from .scraper import Scraper
+from .sources import FetchStatus, SourceState
 
 
 async def run() -> None:
     cfg = load_config()
-    proxy = DirectProxy(cfg.direct_interface) if cfg.direct_interface else None
-    if proxy:
-        await proxy.start()
-    scraper = Scraper(cfg.data_dir / "browser-profile", proxy.url if proxy else None, headless=False)
-    await scraper.start()
-    await scraper.set_window("normal")
+    db = DB(cfg.data_dir / 'bot.sqlite3')
+    proxy, scraper = None, None
     try:
-        status, _ = await scraper.fetch(cfg.feed_url)
-        if status is Status.OK:
-            print("Авито открывается без проверки, разблокировка не нужна.")
+        states = db.source_states('local_browser')
+        if any((s['next_allowed_at'] or 0) > time.time() for s in states):
+            print('Пауза источника ещё не истекла. Новых обращений не выполнялось.')
             return
-        print("В окне браузера нажмите «Продолжить» и решите капчу.")
-        for _ in range(WAIT_MINUTES * 12):
-            await asyncio.sleep(5)
-            status, _ = await scraper.read_current()
-            if status is Status.OK:
-                print("Готово: доступ к Авито есть. Можно запускать бота.")
+        if cfg.direct_interface:
+            proxy = DirectProxy(cfg.direct_interface)
+            await proxy.start()
+        scraper = Scraper(cfg.data_dir / 'browser-profile', proxy.url if proxy else None, headless=False)
+        await scraper.start()
+        await scraper.set_window('normal')
+        waiting = next((s['city'] for s in states if s['state'] == SourceState.WAITING_FOR_USER), cfg.city)
+        from .config import feed_url
+        result = await scraper.load(feed_url(waiting, cfg.feed))
+        for _ in range(180):
+            if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
+                for s in states:
+                    db.save_source_state('local_browser', s['city'], SourceState.ACTIVE)
+                print('Доступ подтверждён. Можно запускать бота; если была пауза — /resume.')
                 return
-        print(f"За {WAIT_MINUTES} минут проверка не пройдена. Если капча не появляется, "
-              "IP заблокирован надолго — подождите несколько часов или перезагрузите роутер.")
+            if result.status is FetchStatus.RATE_LIMITED:
+                db.save_source_state('local_browser', waiting, SourceState.COOLDOWN,
+                                     time.time() + max(cfg.cooldown_seconds, result.retry_after_sec or 0), 'HTTP 429')
+                print('Авито указал паузу. Проверка остановлена.')
+                return
+            if scraper.closed:
+                return
+            print('Пройдите проверку в окне браузера. Повторных загрузок нет.') if _ == 0 else None
+            await asyncio.sleep(5)
+            result = await scraper.read_current()
+        print('Время ожидания истекло. Доступ не подтверждён.')
     finally:
-        await scraper.stop()
+        if scraper:
+            await scraper.stop()
         if proxy:
             await proxy.stop()
+        db.close()
 
 
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     try:
-        asyncio.run(run())
+        with InstanceLock(load_config().data_dir / 'bot.lock'):
+            asyncio.run(run())
+    except BlockingIOError:
+        print('Сначала остановите запущенный бот. Либо используйте в нём /unblock.')
     except KeyboardInterrupt:
         pass

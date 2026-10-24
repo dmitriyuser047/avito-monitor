@@ -1,223 +1,285 @@
-"""Цикл опроса лент: новые объявления → проверка подписок → уведомление.
-
-Блокировки: окно браузера разворачивается, владелец получает сообщение и
-проходит проверку руками; бот ждёт, а потом сам пробует снова с растущей паузой.
-"""
-
+"""Persistent source scheduler. Collection never waits for Telegram item delivery."""
 import asyncio
 import json
 import logging
-import random
 import time
-from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import datetime
 
 from .config import Config, feed_url
-from .db import DB, Subscription
-from .matcher import Item, classify, is_fresh, matches
-from .scraper import Scraper, Status
+from .db import DB
+from .matcher import classify, is_fresh, matches
+from .sources import FetchResult, FetchStatus, Source, SourceState
 
 log = logging.getLogger(__name__)
 
-BLOCK_RETRY_MINUTES = [15, 30, 60]
-MIN_RPM = 1  # ниже бюджет после блокировок не опускаем
-PASS_MINUTES = 15  # капча даёт пропуск ~20 мин; блок позже этого — истёк пропуск, а не частота
-EMPTY_ALERT_AFTER = 3
-ERROR_ALERT_AFTER = 5
-
 
 class BrowserClosed(Exception):
-    """Окно браузера бота закрыли: процесс завершается, start.sh запускает его заново."""
+    """Source stopped; Telegram and the outbox can keep working."""
 
 
 class Monitor:
-    def __init__(
-        self,
-        cfg: Config,
-        db: DB,
-        scraper: Scraper,
-        alert: Callable[[str], Awaitable[None]],
-        send_item: Callable[[Item, list[Subscription]], Awaitable[None]],
-    ):
-        self.cfg = cfg
-        self.db = db
-        self.scraper = scraper
-        self.alert = alert
-        self.send_item = send_item
-        self.paused = db.get("paused") == "1"
-        self.status = "запуск"
-        self.last_ok: float | None = None
-        self.last_cycle_sec: float | None = None
-        self._empty = 0
-        self._errors = 0
-        self.last_items: list[Item] = []  # для /test
-        self._unblocked_at: float | None = None
-
-    # --- бюджет загрузок ---
+    def __init__(self, cfg: Config, db: DB, scraper: Source, alert, send_item=None, recipients=None):
+        self.cfg, self.db, self.scraper, self.alert = cfg, db, scraper, alert
+        self.source_id = getattr(scraper, 'source_id', 'local_browser')
+        self.recipients = recipients or (lambda: [])
+        self.paused = db.get('paused') == '1'
+        self.status = 'запуск'
+        previous_ok = db.conn.execute("SELECT MAX(fetched_at) FROM fetch_metrics WHERE source_id=?"
+                                      " AND status IN ('ok','no_results')", (self.source_id,)).fetchone()[0]
+        self.last_ok = previous_ok
+        self.last_cycle_sec = None
+        self.last_items = []
+        self.last_interval_sec = None
+        self._turn = 0
+        self._last_started = None
+        self._errors = {}
+        self._source_stopped = False
+        self._wake = asyncio.Event()
+        self._source_lock = asyncio.Lock()
 
     def budget(self) -> float:
-        """Сколько загрузок ленты в минуту можно делать сейчас (ночью — меньше)."""
         start, end = self.cfg.night_hours
-        if start <= datetime.now().hour < end:
-            return self.cfg.night_requests_per_minute
-        learned = self.db.get("rpm")  # снижен после блокировок
-        return min(self.cfg.requests_per_minute, float(learned)) if learned else self.cfg.requests_per_minute
+        hour = datetime.now().hour
+        night = start <= hour < end if start <= end else hour >= start or hour < end
+        configured = self.cfg.night_requests_per_minute if night else self.cfg.requests_per_minute
+        learned = self.db.get('rpm')
+        return min(configured, float(learned)) if learned else configured
 
     def delay(self) -> float:
-        base = 60 / max(self.budget(), 0.1)
-        return base * random.uniform(0.8, 1.2)
+        return 60 / max(self.budget(), .01)
 
     def city_period(self) -> float:
-        """Раз в сколько секунд проверяется каждый город."""
-        return len(self.cities()) * 60 / max(self.budget(), 0.1)
+        return len(self.cities()) * (self.delay() + (self.last_cycle_sec or 0))
 
     def _slow_down(self) -> float | None:
-        current = float(self.db.get("rpm") or self.cfg.requests_per_minute)
-        lowered = max(MIN_RPM, current - 1)
+        """Compatibility for existing saved limits; not a recovery mechanism."""
+        current = float(self.db.get('rpm') or self.cfg.requests_per_minute)
+        lowered = max(1, current - 1)
         if lowered < current:
-            self.db.set("rpm", f"{lowered:g}")
+            self.db.set('rpm', f'{lowered:g}')
             return lowered
         return None
 
-    # --- опрос ---
-
-    async def run(self) -> None:
-        turn = 0
-        while True:
-            if self.paused:
-                self.status = "пауза"
-                await asyncio.sleep(2)
-                continue
-            self._check_browser()
-            cities = self.cities()
-            city = cities[turn % len(cities)]
-            turn += 1
-            url = feed_url(city, self.cfg.feed)
-            started = time.monotonic()
-            status, items = await self.scraper.fetch(url)
-            for item in items:
-                item.city = city
-            if status is Status.BLOCKED:
-                await self._wait_unblock(url)
-                continue
-            items = [i for i in items if i.feed in self.cfg.sections]  # только комплектующие и ПК
-            await self._handle(status, items, url)
-            self.last_cycle_sec = time.monotonic() - started
-            await asyncio.sleep(self.delay())
-
     def cities(self) -> list[str]:
-        """Города активных запросов (у запроса без городов — город из настроек)."""
-        subs = self.db.subscriptions(only_enabled=True)
-        cities = {c for s in subs for c in (s.cities or [self.cfg.city])}
+        cities = {c for s in self.db.subscriptions(only_enabled=True) for c in (s.cities or [self.cfg.city])}
         return sorted(cities, key=lambda c: (c != self.cfg.city, c)) or [self.cfg.city]
 
-    async def _handle(self, status: Status, items: list[Item], url: str) -> None:
-        if status is Status.OK:
-            self.status = "работает"
-            self.last_ok = time.time()
-            self._empty = self._errors = 0
-            self.last_items = items
-            self._dump(url, items)
-            if self.db.get(f"feed:{url}") is None:
-                # новая лента (например, запрос в новом городе): то, что уже висит, не присылаем
-                self.db.mark_seen([i.id for i in items])
-                self.db.set(f"feed:{url}", "1")
-                log.info("Новая лента %s: %d объявлений отмечены как просмотренные", url, len(items))
-                return
-            await self._process(items)
-        elif status is Status.EMPTY:
-            self._empty += 1
-            if self._empty == EMPTY_ALERT_AFTER:
-                await self.alert(
-                    "Лента пустая\n"
-                    f"{EMPTY_ALERT_AFTER} раза подряд на странице не нашлось объявлений:\n{url}\n\n"
-                    "Скорее всего, Авито поменял вёрстку и парсер нужно поправить."
-                )
-        else:
-            self._errors += 1
-            if self._errors == ERROR_ALERT_AFTER:
-                await self.alert(f"Нет связи с Авито\n{ERROR_ALERT_AFTER} ошибок загрузки подряд. Проверьте интернет на Mac.")
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception('Scheduler failure; collection stopped, Telegram remains available')
+                self._source_stopped = True
+                self.status = 'STOPPED: ошибка планировщика'
+                self.db.save_source_state(self.source_id, '*', SourceState.STOPPED, reason='scheduler failure')
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), 1)
+            except TimeoutError:
+                pass
 
-    async def _process(self, items: list[Item]) -> None:
-        new_ids = self.db.unseen([i.id for i in items])
-        if not new_ids:
-            return
-        self.db.mark_seen(list(new_ids))
-        self._log_items([i for i in items if i.id in new_ids])  # до found_at: в логе есть seen_at
-        subs = self.db.subscriptions(only_enabled=True)
+    async def poll_once(self) -> bool:
+        async with self._source_lock:
+            return await self._poll_once()
+
+    async def _poll_once(self) -> bool:
+        if hasattr(self.scraper, 'cleanup_debug'):
+            self.scraper.cleanup_debug()
+        try:
+            self._check_browser()
+        except BrowserClosed:
+            if not self._source_stopped:
+                self._source_stopped = True
+                self.status = 'STOPPED: браузер закрыт'
+                self.db.save_source_state(self.source_id, '*', SourceState.STOPPED, reason='browser closed')
+                await self.alert('Браузер закрыт\nСбор остановлен. Telegram и очередь доставки продолжают работать. '
+                                 'Для возобновления запустите бот заново; автоматического перезапуска браузера нет.')
+            return False
+        if self._source_stopped:
+            return False
+        if self.paused:
+            self.status = 'PAUSED: пауза'
+            return False
+        if not self.db.subscriptions(only_enabled=True):
+            self.status = 'нет активных запросов'
+            return False
         now = time.time()
+        for state in self.db.source_states(self.source_id):
+            if state['state'] == SourceState.WAITING_FOR_USER:
+                self.status = 'WAITING_FOR_USER: требуется проверка Авито'
+                return False
+            if state['state'] in (SourceState.COOLDOWN, SourceState.DEGRADED):
+                if (state['next_allowed_at'] or 0) > now:
+                    self.status = state['state'] + ': ' + state['reason']
+                    return False
+        if float(self.db.get(f'next_poll:{self.source_id}') or 0) > now:
+            return False
+        cities = self.cities()
+        city = cities[self._turn % len(cities)]
+        self._turn += 1
+        url = feed_url(city, self.cfg.feed)
+        started = time.monotonic()
+        if self._last_started:
+            self.last_interval_sec = now - self._last_started
+        self._last_started = now
+        # Persist budget before I/O, so a crash/restart cannot immediately poll again.
+        self.db.set(f'next_poll:{self.source_id}', str(now + self.delay()))
+        result = await self.scraper.fetch(url)
+        self.last_cycle_sec = time.monotonic() - started
+        self.db.set(f'next_poll:{self.source_id}', str(time.time() + self.delay()))
+        await self._handle(result, url)
+        return True
+
+    async def _handle(self, result: FetchResult, url: str) -> None:
+        status, city = result.status, result.city
+        until = None
+        matched = 0
+        previous = self.db.latest_snapshot(self.source_id, city)
+        ids = {i.id for i in result.items}
+        overlap = len(ids & previous[0]) if previous else None
+        if status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
+            self.status = 'ACTIVE: работает'
+            self.last_ok = result.observed_at
+            self._errors[city] = 0
+            self.db.set(f'errors:{self.source_id}:{city}', '0')
+            self.db.save_source_state(self.source_id, city, SourceState.ACTIVE)
+            items = [i for i in result.items if i.feed in self.cfg.sections]
+            for item in items:
+                item.city = city
+            self.last_items = items
+            if self.db.get(f'feed:{url}') is None:
+                # Seed existing listings; preserve the legacy baseline key.
+                self.db.mark_seen([i.id for i in items])
+                self.db.set(f'feed:{url}', '1')
+            else:
+                matched = self._process(items, result.observed_at)
+            if ids and previous and previous[0] and overlap == 0:
+                key = f'coverage:{self.source_id}:{city}'
+                if self.db.get(key) != 'gap':
+                    await self.alert(f'Возможны пропуски в выдаче\nГород: {city}. '
+                                     'У соседних снимков нет общих объявлений. Дополнительные запросы не выполняются.')
+                self.db.set(key, 'gap')
+            elif ids:
+                self.db.set(f'coverage:{self.source_id}:{city}', 'ok')
+        elif status is FetchStatus.RATE_LIMITED:
+            until = time.time() + max(self.cfg.cooldown_seconds, result.retry_after_sec or 0)
+            changed = self.db.save_source_state(self.source_id, city, SourceState.COOLDOWN, until, 'HTTP 429')
+            self.status = 'COOLDOWN: Авито ограничил частоту'
+            if changed:
+                await self.alert('Авито ограничил частоту\nОпрос остановлен до '
+                                 + datetime.fromtimestamp(until).strftime('%d.%m %H:%M') + '. Очередь Telegram работает.')
+        elif status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
+            until = time.time() + result.retry_after_sec if result.retry_after_sec else None
+            changed = self.db.save_source_state(self.source_id, city, SourceState.WAITING_FOR_USER, until, status.value)
+            self.status = 'WAITING_FOR_USER: Авито ограничил доступ'
+            if changed:
+                if hasattr(self.scraper, 'set_window'):
+                    await self.scraper.set_window('normal')
+                await self.alert('Авито ограничил доступ\nОпрос полностью остановлен и сам не возобновится. '
+                                 'Команда /unblock откроет страницу проверки по вашему запросу. '
+                                 'Пройдите проверку в браузере, затем /resume. Очередь Telegram работает.')
+        else:
+            self._errors[city] = int(self.db.get(f'errors:{self.source_id}:{city}') or 0) + 1
+            self.db.set(f'errors:{self.source_id}:{city}', str(self._errors[city]))
+            delay = min(3600, 60 * 2 ** min(self._errors[city] - 1, 6))
+            if status is FetchStatus.PARSE_CHANGED:
+                delay = max(900, delay)
+            until = time.time() + max(delay, result.retry_after_sec or 0)
+            changed = self.db.save_source_state(self.source_id, city, SourceState.DEGRADED, until, status.value)
+            self.status = 'DEGRADED: ' + status.value
+            if changed:
+                await self.alert('Источник недоступен\n' + ('Изменилась структура выдачи.' if status is FetchStatus.PARSE_CHANGED
+                                                        else 'Ошибка сети или сервера.') + ' Повторы ограничены паузой.')
+        self.db.record_fetch(source_id=self.source_id, city=city, fetched_at=result.observed_at,
+                             status=status.value, http_status=result.http_status,
+                             raw_count=result.diagnostics.get('raw_count', len(result.items)), matched_count=matched,
+                             overlap_count=overlap, interval_sec=(result.observed_at - previous[1]) if previous else None,
+                             cooldown_until=until, item_ids_json=json.dumps(sorted(ids)))
+        log.info('Fetch source=%s city=%s status=%s http=%s raw=%s matched=%s overlap=%s cooldown_until=%s',
+                 self.source_id, city, status.value, result.http_status,
+                 result.diagnostics.get('raw_count', len(result.items)), matched, overlap, until)
+
+    def _process(self, items, observed_at: float) -> int:
+        subs = self.db.subscriptions(only_enabled=True)
+        entries, matched_count = [], 0
+        unseen = self.db.unseen([i.id for i in items])
+        recipients = self.recipients()
         for item in items:
-            city_subs = [s for s in subs if item.city in (s.cities or [self.cfg.city])]
-            if item.id not in new_ids:
+            if item.id not in unseen:
                 continue
-            item.found_at = now
-            if not is_fresh(item):
-                log.info("Пропуск (не свежее): %s | %s | %s", item.id, item.date, item.title)
-                continue
-            matched = [s for s in city_subs if matches(item, s)]
-            published = datetime.fromtimestamp(item.published).strftime("%H:%M") if item.published else "?"
-            log.info("Новое: %s (опубл. %s) | %s | %s ₽ | совпадений: %d",
-                     item.date, published, item.title, item.price, len(matched))
-            if matched:
-                await self.send_item(item, matched)
-                self.db.record_notification(item.id, [s.id for s in matched])
-
-    def _dump(self, url: str, items: list[Item]) -> None:
-        """Последняя загруженная лента — для диагностики."""
-        path = self.cfg.data_dir / "feeds" / (url.split("/", 3)[-1].split("?")[0].replace("/", "_") + ".json")
-        path.parent.mkdir(exist_ok=True)
-        path.write_text(json.dumps([asdict(i) for i in items], ensure_ascii=False, indent=1), encoding="utf-8")
-
-    def _log_items(self, items: list[Item]) -> None:
-        """Все новые объявления — в data/items.jsonl, чтобы улучшать поиск на реальных данных."""
-        with open(self.cfg.data_dir / "items.jsonl", "a", encoding="utf-8") as f:
-            for i in items:
-                f.write(json.dumps({**asdict(i), "seen_at": time.time(), "categories": sorted(classify(i))},
-                                   ensure_ascii=False) + "\n")
+            item.found_at = observed_at
+            matched = [s for s in subs if item.city in (s.cities or [self.cfg.city]) and matches(item, s)] if is_fresh(item) else []
+            matched_count += bool(matched)
+            payload = {'item': asdict(item), 'subs': [asdict(s) for s in matched], 'source_id': self.source_id}
+            entries.append((item.id, payload, recipients if matched else []))
+        inserted = self.db.stage_items(entries, observed_at)
+        # Diagnostic files are never part of the delivery transaction.
+        try:
+            with (self.cfg.data_dir / 'items.jsonl').open('a', encoding='utf-8') as f:
+                for item in items:
+                    if item.id in inserted:
+                        f.write(json.dumps({**asdict(item), 'source_id': self.source_id, 'seen_at': observed_at,
+                                            'categories': sorted(classify(item))}, ensure_ascii=False) + '\n')
+        except OSError:
+            log.warning('Cannot append diagnostic items; durable events are already stored')
+        return matched_count
 
     def _check_browser(self) -> None:
         if self.scraper.closed:
-            log.warning("Окно браузера закрыто — бот перезапустится")
             raise BrowserClosed()
 
     def set_paused(self, paused: bool) -> None:
         self.paused = paused
-        self.db.set("paused", "1" if paused else "0")
+        self.db.set('paused', '1' if paused else '0')
+        if not paused:
+            # Explicit user permission to try once; Retry-After always remains binding.
+            now = time.time()
+            for state in self.db.source_states(self.source_id):
+                if state['state'] == SourceState.WAITING_FOR_USER and (state['next_allowed_at'] or 0) <= now:
+                    self.db.save_source_state(self.source_id, state['city'], SourceState.ACTIVE)
+        self._wake.set()
 
-    async def _wait_unblock(self, url: str) -> None:
-        self.status = "заблокирован Авито"
-        log.warning("Авито ограничил доступ")
-        # блок через 15+ минут после капчи — истёк пропуск, частота тут ни при чём
-        pass_expired = self._unblocked_at and time.time() - self._unblocked_at > PASS_MINUTES * 60
-        lowered = None if pass_expired else self._slow_down()
-        await self.scraper.set_window("normal")
-        await self.alert(
-            "Авито ограничил доступ\n"
-            "На компьютере открылось окно браузера: нажмите в нём «Продолжить» и решите капчу — "
-            "слежение продолжится само.\n\n"
-            + (f"Чтобы это повторялось реже, бот снизил частоту до {lowered:g} загрузок в минуту.\n"
-               if lowered else "")
-            + f"Если ничего не делать, бот попробует снова через {BLOCK_RETRY_MINUTES[0]} мин."
-        )
-        attempt = 0
-        next_retry = time.monotonic() + BLOCK_RETRY_MINUTES[0] * 60
-        while True:
-            await asyncio.sleep(5)
-            self._check_browser()
-            status, items = await self.scraper.read_current()
-            # не перезагружаем страницу, пока человек решает капчу
-            if status is not Status.OK and time.monotonic() >= next_retry and not await self.scraper.captcha_open():
-                status, items = await self.scraper.fetch(url)
-                attempt += 1
-                next_retry = time.monotonic() + BLOCK_RETRY_MINUTES[min(attempt, len(BLOCK_RETRY_MINUTES) - 1)] * 60
-            if status is Status.OK:
-                await self.scraper.set_window("minimized")
-                self.status = "работает"
-                self._unblocked_at = time.time()
-                await self.alert("Доступ восстановлен\nСлежение продолжается.")
-                city = url.split("/")[3]
-                for item in items:
-                    item.city = city
-                await self._handle(status, [i for i in items if i.feed in self.cfg.sections], url)
-                return
+    async def open_verification(self) -> str:
+        async with self._source_lock:
+            return await self._open_verification()
+
+    async def _open_verification(self) -> str:
+        self._check_browser()
+        states = self.db.source_states(self.source_id)
+        if any((s['next_allowed_at'] or 0) > time.time() for s in states):
+            return 'Пауза источника ещё не истекла. Проверьте /health.'
+        waiting = [s for s in states if s['state'] == SourceState.WAITING_FOR_USER]
+        if not waiting:
+            return 'Ограничений, требующих ручной проверки, нет. Проверьте /health.'
+        if not hasattr(self.scraper, 'load'):
+            return 'Этот источник не поддерживает проверку в браузере.'
+        self.paused = True
+        self.db.set('paused', '1')
+        await self.scraper.set_window('normal')
+        city = waiting[0]['city']
+        result = await self.scraper.load(feed_url(city, self.cfg.feed))
+        self.db.set(f'next_poll:{self.source_id}', str(time.time() + self.delay()))
+        await self._handle(result, feed_url(city, self.cfg.feed))
+        return 'Страница открыта по вашему запросу. Пройдите проверку в браузере, затем отправьте /resume.'
+
+    def health_text(self) -> str:
+        import html
+        states = self.db.source_states(self.source_id)
+        lines = ['<b>Здоровье бота</b>', html.escape(self.status),
+                 f'Источник: {self.source_id}', f'Бюджет: {self.budget():g}/мин',
+                 'Последняя проверка: ' + (datetime.fromtimestamp(self.last_ok).strftime('%d.%m %H:%M:%S') if self.last_ok else 'ещё не было'),
+                 f'Фактический интервал: {self.last_interval_sec:.1f} с' if self.last_interval_sec else 'Фактический интервал: ещё не измерен',
+                 'Очередь: ' + str(self.db.queue_counts())]
+        for s in states:
+            until = datetime.fromtimestamp(s['next_allowed_at']).strftime('%d.%m %H:%M:%S') if s['next_allowed_at'] else '—'
+            lines.append(html.escape(f"{s['city']}: {s['state']} ({s['reason']}), до {until}"))
+        latency = self.db.latency_stats()
+        for metric, label in (('delivery', 'Обнаружение → Telegram'), ('publish', 'Публикация → Telegram')):
+            stats = latency[metric]
+            if stats:
+                lines.append(f"{label}: n={stats['n']}, p50={stats['p50']:.1f} с, p95={stats['p95']:.1f} с, ≤60 с: {stats['within_60']:.0%}")
+        return '\n'.join(lines)

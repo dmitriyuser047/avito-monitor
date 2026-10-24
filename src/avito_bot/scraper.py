@@ -20,7 +20,8 @@ from .matcher import Item
 log = logging.getLogger(__name__)
 
 
-EXTRACT_JS = """() => [...document.querySelectorAll('[data-marker="catalog-serp"] [data-marker="item"]')].map(e => {
+# Достаёт объявления из документа: и из открытой страницы, и из HTML, полученного fetch
+EXTRACT_FN = """(root) => [...root.querySelectorAll('[data-marker="catalog-serp"] [data-marker="item"]')].map(e => {
   const q = s => e.querySelector(s);
   const link = q('[data-marker="item-title"]') || q('a[itemprop="url"]');
   return {
@@ -36,6 +37,16 @@ EXTRACT_JS = """() => [...document.querySelectorAll('[data-marker="catalog-serp"
       ?.textContent?.trim()?.slice(0, 600) || '',
   };
 })"""
+
+# Лёгкий опрос: один запрос HTML ленты из уже открытой страницы Авито (те же cookies и
+# отпечаток настоящего браузера), без загрузки 350 картинок, скриптов и аналитики.
+LIGHT_JS = f"""async (url) => {{
+  const r = await fetch(url, {{credentials: 'include', cache: 'no-store',
+                               headers: {{'accept': 'text/html,application/xhtml+xml'}}}});
+  const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+  return {{status: r.status, url: r.url, title: doc.title, items: ({EXTRACT_FN})(doc)}};
+}}"""
+
 
 
 class Status(Enum):
@@ -53,6 +64,8 @@ class Scraper:
         self._pw = None
         self.ctx: BrowserContext | None = None
         self.page: Page | None = None
+        self._final_url: dict[str, str] = {}  # адрес ленты после редиректа Авито
+        self.light_ok = False  # открыта ли страница Авито, из которой можно делать лёгкие запросы
 
     async def start(self) -> None:
         self._pw = await async_playwright().start()
@@ -97,6 +110,26 @@ class Scraper:
             log.debug("Не удалось изменить окно: %s", e)
 
     async def fetch(self, url: str) -> tuple[Status, list[Item]]:
+        """Лента: лёгким запросом, а если Авито просит проверку — полной загрузкой страницы."""
+        if self.light_ok:
+            try:
+                res = await self.page.evaluate(LIGHT_JS, self._final_url.get(url, url))
+                if res["status"] == 200 and "Доступ ограничен" not in res["title"]:
+                    self._final_url[url] = res["url"]
+                    items = [_to_item(r) for r in res["items"] if r.get("id")]
+                    return (Status.OK if items else Status.EMPTY), items
+                log.info("Лёгкий запрос: %s «%s» — открываю страницу целиком", res["status"], res["title"][:40])
+            except Exception as e:
+                log.warning("Лёгкий запрос не удался: %s", e)
+        self.light_ok = False
+        status, items = await self.load(url)
+        if status is Status.OK:
+            self.light_ok = True
+            self._final_url[url] = self.page.url
+        return status, items
+
+    async def load(self, url: str) -> tuple[Status, list[Item]]:
+        """Полная загрузка страницы — так проходит JS-проверка Авито и показывается капча."""
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             # первая загрузка может пройти через JS-проверку (код 439) и редирект
@@ -143,11 +176,13 @@ class Scraper:
             title = await self.page.title()
             if "Доступ ограничен" in title:
                 return Status.BLOCKED, []
-            raw = await self.page.evaluate(EXTRACT_JS)
+            raw = await self.page.evaluate(f"({EXTRACT_FN})(document)")
         except Exception as e:
             log.warning("Ошибка разбора страницы: %s", e)
             return Status.ERROR, []
         items = [_to_item(r) for r in raw if r.get("id")]
+        if items:
+            self.light_ok = True  # открыта нормальная страница Авито (в т.ч. после капчи)
         return (Status.OK if items else Status.EMPTY), items
 
 

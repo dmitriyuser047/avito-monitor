@@ -131,3 +131,8 @@ def test_explicit_category():
 def test_wanted_ads_skipped():
     assert not matches(item("Куплю видеокарту rtx 3060"), sub("rtx 3060"))
     assert not matches(item("Скупка видеокарт"), sub("видеокарта"))
+
+
+def test_typos():
+    from avito_bot.matcher import classify
+    assert classify(item("Razen 7 9700x")) == {"cpu"}

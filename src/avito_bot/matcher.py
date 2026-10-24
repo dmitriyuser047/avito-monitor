@@ -82,7 +82,7 @@ STOPWORDS = {"блок", "питания", "игровой", "игровая", "
 # Кириллица и сленг в моделях → как пишут латиницей
 ALIASES = [
     (r"\bртх\b", "rtx"), (r"\bгтх\b", "gtx"), (r"\bрх\b", "rx"), (r"\bрадеон\w*", "radeon"),
-    (r"\bджифорс\w*", "geforce"), (r"\bрайзен\w*", "ryzen"), (r"\bрузен\w*", "ryzen"), (r"\bинтел\w*", "intel"),
+    (r"\bджифорс\w*", "geforce"), (r"\bрайзен\w*", "ryzen"), (r"\b(?:razen|raizen|rizen|ryzon|ruzen)\b", "ryzen"), (r"\bрузен\w*", "ryzen"), (r"\bинтел\w*", "intel"),
     (r"\bксеон\w*", "xeon"), (r"\bсупер\b", "super"), (r"\bти\b", "ti"),
     (r"\bгб\b", "gb"), (r"\bтб\b", "tb"), (r"\bмгц\b", "mhz"), (r"\bвт\b", "w"),
 ]

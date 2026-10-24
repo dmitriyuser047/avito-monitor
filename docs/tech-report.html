@@ -1,0 +1,195 @@
+<title>Авито-монитор: как устроен</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: одна колонка технической записки, таблицы и схемы — во всю ширину колонки */
+:root {
+  --bg: #f6f7f5;
+  --surface: #ffffff;
+  --fg: #1d2421;
+  --muted: #5b6661;
+  --line: #d9dfdb;
+  --accent: #00875a;
+  --warn: #b4530b;
+  --bad: #b42318;
+  --code-bg: #eef1ef;
+  --font-body: "Golos Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141917; --surface: #1b211f; --fg: #e4e9e6; --muted: #9aa6a0; --line: #2e3734;
+    --accent: #3fc28d; --warn: #f0a052; --bad: #f2786d; --code-bg: #222a27; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #141917; --surface: #1b211f; --fg: #e4e9e6; --muted: #9aa6a0; --line: #2e3734;
+  --accent: #3fc28d; --warn: #f0a052; --bad: #f2786d; --code-bg: #222a27; color-scheme: dark;
+}
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--font-body);
+  font-size: 16px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 860px; margin: 0 auto; padding-block: 48px 72px; display: flex; flex-direction: column; gap: 40px; }
+header { display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid var(--line); padding-bottom: 28px; }
+.eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+h1 { font-size: clamp(28px, 4.5vw, 40px); line-height: 1.15; margin: 0; font-weight: 700; text-wrap: balance; }
+h2 { font-size: 22px; margin: 0; font-weight: 650; text-wrap: balance; }
+h3 { font-size: 17px; margin: 0; font-weight: 600; }
+.lead { color: var(--muted); max-width: 65ch; margin: 0; }
+section { display: flex; flex-direction: column; gap: 14px; }
+p, li { max-width: 68ch; }
+p { margin: 0; }
+ul, ol { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 6px; }
+code { font-family: var(--font-mono); font-size: .88em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre.code { font-family: var(--font-mono); font-size: 13px; background: var(--code-bg); padding: 14px 16px; border-radius: 8px; overflow-x: auto; margin: 0; line-height: 1.5; }
+.table { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.t { font-family: var(--font-mono); white-space: nowrap; }
+.pill { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; border: 1px solid currentColor; }
+.ok { color: var(--accent); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.fact { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.fact b { font-size: 22px; font-variant-numeric: tabular-nums; }
+.fact span { color: var(--muted); font-size: 13px; }
+.note { border-left: 3px solid var(--warn); padding: 4px 0 4px 14px; color: var(--fg); }
+pre.mermaid { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; overflow-x: auto; margin: 0; }
+footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); padding-top: 18px; }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">Техническая записка · 24 октября 2026</div>
+  <h1>Авито-монитор: как устроен и почему его блокируют</h1>
+  <p class="lead">Личный Telegram-бот, который присылает новые объявления Авито о комплектующих и компьютерах в Казани. Ниже — архитектура, как устроен опрос, что показали замеры и где упираемся в защиту Авито.</p>
+</header>
+
+<section>
+  <h2>Задача</h2>
+  <ul>
+    <li>Следить за разделами «Товары для компьютера» и «Настольные компьютеры» в одном или нескольких городах.</li>
+    <li>Пользователь задаёт запросы: раздел (видеокарты, процессоры, ПК…), модель, цену, слова-исключения.</li>
+    <li>Новое подходящее объявление должно прийти в Telegram как можно быстрее. Исходная цель — 15–30 секунд.</li>
+    <li>Запуск на обычных домашних ПК: VPS и VPN Авито блокирует сразу, поэтому нужен домашний IP.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Архитектура</h2>
+  <pre class="mermaid">
+flowchart LR
+  subgraph PC["Домашний ПК (macOS / Windows / Linux)"]
+    M["Monitor<br/>цикл опроса, лимит запросов"] --> S["Scraper<br/>Playwright + Google Chrome<br/>постоянный профиль"]
+    S --> P["DirectProxy<br/>обход VPN через домашнюю сеть"]
+    M --> F["Matcher<br/>разделы, модели, цены"]
+    F --> T["Telegram-бот<br/>aiogram 3"]
+    M --> D[("SQLite<br/>запросы, просмотренные,<br/>участники")]
+  end
+  P --> A["avito.ru"]
+  T --> TG["Telegram"]
+  </pre>
+  <div class="table"><table>
+    <thead><tr><th>Модуль</th><th>Что делает</th></tr></thead>
+    <tbody>
+      <tr><td><code>scraper.py</code></td><td>Запускает настоящий Google Chrome через Playwright (<code>channel="chrome"</code>, окно свёрнуто, без флага <code>--enable-automation</code>). Если Chrome нет — встроенный Chromium. Достаёт объявления из DOM и точное время публикации из служебного JSON страницы.</td></tr>
+      <tr><td><code>monitor.py</code></td><td>По кругу опрашивает ленты городов в пределах лимита загрузок в минуту; отмечает просмотренные ID; при блокировке разворачивает окно браузера, пишет в Telegram и ждёт, пока человек пройдёт капчу.</td></tr>
+      <tr><td><code>matcher.py</code></td><td>Нормализует названия (<code>RTX3060Ti</code> = <code>ртх 3060 ти</code>, <code>1660S</code> = <code>1660 super</code>), определяет раздел объявления (видеокарта, процессор, память, мать, накопитель, БП, охлаждение, корпус, ПК), сверяет с запросами.</td></tr>
+      <tr><td><code>bot.py</code>, <code>ui.py</code></td><td>Интерфейс на inline-кнопках: меню, мастер запроса, карточки, выбор городов, доступ по ссылке-приглашению, уведомления с фото.</td></tr>
+      <tr><td><code>direct_proxy.py</code></td><td>Локальный HTTP CONNECT-прокси: если на ПК включён VPN в режиме TUN, трафик к Авито уходит напрямую через домашнюю сеть (DNS через DoH, сокет привязан к интерфейсу).</td></tr>
+      <tr><td><code>start.sh</code> / <code>start.bat</code></td><td>Установка (uv, Python, Chromium), первичная настройка (токен, город, VPN) и запуск с автоперезапуском.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Как идёт опрос</h2>
+  <ol>
+    <li>При старте Chrome открывает ленту города полной загрузкой: <code>/kazan/bytovaya_elektronika?s=104</code> (раздел «Электроника», сортировка по дате). Так проходит JS-проверка Авито (код 439, proof-of-work), если она есть.</li>
+    <li>Дальше страница больше не перезагружается. Каждую итерацию из неё выполняется <code>fetch(url, {credentials: "include"})</code> к той же ленте, ответ разбирается <code>DOMParser</code>. Это один HTTP-запрос вместо ~350 при полной загрузке (из них ~60 на домены Авито).</li>
+    <li>Из 50 объявлений ленты остаются только разделы <code>tovary_dlya_kompyutera</code> и <code>nastolnye_kompyutery</code> (по адресу объявления). Одна лента «Электроника» на город вместо двух отдельных — вдвое меньше запросов.</li>
+    <li>Новые ID сверяются с запросами, подходящие уходят в Telegram.</li>
+    <li>Если ответ 403/429 или заголовок «Доступ ограничен» — полная загрузка страницы, чтобы показать капчу, и ожидание человека.</li>
+  </ol>
+  <pre class="code">// упрощённо: лёгкий опрос из уже открытой страницы Авито
+const r = await fetch(url, {credentials: 'include', cache: 'no-store'});
+const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+const items = [...doc.querySelectorAll('[data-marker="catalog-serp"] [data-marker="item"]')];
+// точное время: script[type="mime/invalid"] → объекты с id и sortTimeStamp</pre>
+  <p>Лимит загрузок задаётся в <code>.env</code> (<code>REQUESTS_PER_MINUTE</code>, сейчас 2) и делится между городами: один город при 2/мин проверяется раз в ~30 с. Ночью — 1 в минуту.</p>
+</section>
+
+<section>
+  <h2>Что показали замеры</h2>
+  <div class="facts">
+    <div class="fact"><b>~350</b><span>запросов на одну полную загрузку ленты</span></div>
+    <div class="fact"><b>1</b><span>запрос на лёгкий опрос из открытой страницы</span></div>
+    <div class="fact"><b>~100 с</b><span>медиана от публикации до появления у бота (мин. 42 с)</span></div>
+    <div class="fact"><b>~22 / час</b><span>новых объявлений в двух разделах, Казань, день</span></div>
+  </div>
+  <p>Большая часть задержки — на стороне Авито: объявление попадает в поиск в среднем через 1–1,5 минуты после публикации (видно по <code>sortTimeStamp</code>). Доля бота — ожидание следующего опроса, 0–30 секунд. Надпись «1 час назад» в карточке неточная: встречалась у объявлений, опубликованных 4 минуты назад.</p>
+</section>
+
+<section>
+  <h2>Блокировки</h2>
+  <p>Авито отвечает на подозрительные запросы тремя способами:</p>
+  <div class="table"><table>
+    <thead><tr><th>Ответ</th><th>Страница</th><th>Как проходится</th></tr></thead>
+    <tbody>
+      <tr><td class="t">439</td><td>«Доступ ограничен: проверка безопасности»</td><td>JS proof-of-work, браузер проходит сам за пару секунд. Простой HTTP-клиент (даже с TLS-отпечатком Chrome) не проходит.</td></tr>
+      <tr><td class="t">429 / 403</td><td>«Доступ ограничен: проблема с IP»</td><td>Кнопка «Продолжить» → капча (GeeTest или hCaptcha). Проходит человек.</td></tr>
+      <tr><td class="t">—</td><td>Кнопка «Продолжить» не реагирует</td><td>Было в Chromium из Playwright с флагом <code>--enable-automation</code>; в установленном Google Chrome без этого флага капча показывается.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Хронология 23–24 октября</h3>
+  <div class="table"><table>
+    <thead><tr><th>Время</th><th>Режим</th><th>Результат</th></tr></thead>
+    <tbody>
+      <tr><td class="t">23.10 вечер</td><td>Headless Chromium, домашний IP</td><td><span class="pill bad">блок</span> сразу; несколько тестовых запусков подряд</td></tr>
+      <tr><td class="t">01:20</td><td>Chrome, 2 ленты каждые 10 с, полная загрузка</td><td><span class="pill bad">блок</span> через 5,5 мин</td></tr>
+      <tr><td class="t">12:04</td><td>Лёгкий fetch, 2 ленты каждые 10 с (~12/мин)</td><td><span class="pill bad">блок</span> через 5 мин</td></tr>
+      <tr><td class="t">12:14</td><td>Одна лента «Электроника», 5/мин</td><td><span class="pill ok">ок</span> 5 мин, затем остановлен вручную</td></tr>
+      <tr><td class="t">12:19</td><td>Перезапуск</td><td><span class="pill bad">блок</span> через 12 с</td></tr>
+      <tr><td class="t">12:39 → 13:44</td><td>4 → 3 → 2/мин, без перезапусков</td><td><span class="pill warn">капча</span> ровно каждые 20 мин после прохождения</td></tr>
+      <tr><td class="t">14:16</td><td>Новый IP (перезагрузка роутера), чистый профиль, 4/мин</td><td><span class="pill bad">блок</span> через 2 мин</td></tr>
+      <tr><td class="t">14:22</td><td>Мобильный IP (раздача с iPhone), тот же профиль</td><td><span class="pill bad">блок</span> сразу</td></tr>
+      <tr><td class="t">14:24</td><td>Мобильный IP, ещё один чистый профиль: одна загрузка</td><td><span class="pill ok">ок</span></td></tr>
+      <tr><td class="t">14:24</td><td>Тот же профиль, запуск бота через минуту</td><td><span class="pill bad">блок</span> сразу</td></tr>
+      <tr><td class="t">14:33</td><td>Домашний IP, чистый профиль, 2/мин, один запуск без перезапусков</td><td><span class="pill bad">блок</span> через 10 мин</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Выводы и гипотезы</h3>
+  <ul>
+    <li><b>Частота важна, но не решает.</b> При ~12 загрузках в минуту блок через ~5 мин. При 2–4 в минуту — всё равно блок, только позже (2–24 мин).</li>
+    <li><b>После пометки капча даёт пропуск ровно на 20 минут</b> (13:04 → 13:24 → 13:44), независимо от частоты.</li>
+    <li><b>Пометка привязана к профилю браузера (cookies), а не только к IP.</b> Помеченный профиль блокируется сразу на любом IP; чистый профиль проходит, пока с ним не начнёт работать бот.</li>
+    <li><b>Вероятная причина:</b> Авито распознаёт управление браузером через Playwright (подключение по протоколу отладки Chrome) и/или поведенческий паттерн — одна страница без действий пользователя и периодические <code>fetch</code> HTML-документа из неё.</li>
+    <li>Частые перезапуски бота (каждый — новая полная загрузка) явно ускоряли блокировки.</li>
+  </ul>
+  <p class="note">Обход защиты (автоматическое решение капчи, подмена отпечатков, ротация профилей) в проекте не делался сознательно. Сейчас бот работает в режиме «бот + человек»: когда Авито просит проверку, бот пишет в Telegram, и капчу проходит пользователь.</p>
+</section>
+
+<section>
+  <h2>Открытые вопросы</h2>
+  <ul>
+    <li>Есть ли у Авито режим работы, при котором такой мониторинг допустим без капчи — например, при заметно меньшей частоте или в рамках официальных инструментов.</li>
+    <li>Насколько быстро приходят пуш-уведомления сохранённого поиска Авито по сравнению с измеренными ~100 с — если сопоставимо, это вариант без автоматизации браузера.</li>
+    <li>Как ведёт себя один бот на других домашних ПК (другой IP и отпечаток) при 1–2 загрузках в минуту на протяжении нескольких часов.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Стек</h2>
+  <p>Python 3.12 (uv), Playwright 1.64 + Google Chrome, aiogram 3.31 (Telegram Bot API 10.3), SQLite, httpx. Тесты — pytest (22 теста: поиск, разделы, интерфейс, доступ, лимиты). Проект — git-репозиторий, запуск через <code>start.sh</code> / <code>start.bat</code>.</p>
+</section>
+
+<footer>Цифры — из логов бота и файла новых объявлений за 23–24 октября 2026, Казань. Токены, IP-адреса и идентификаторы пользователей в записку не включены.</footer>
+</div>

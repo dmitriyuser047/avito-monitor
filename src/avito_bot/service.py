@@ -8,12 +8,33 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime
 
 from .config import ROOT
 from .runtime import InstanceLock
 
 LABEL = 'local.avito-monitor'
+
+
+@contextmanager
+def installation_lock(path: Path, timeout: float = 25):
+    """launchctl bootout returns before the application's cleanup always ends."""
+    deadline = time.monotonic() + timeout
+    while True:
+        lock = InstanceLock(path)
+        try:
+            lock.__enter__()
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Previous instance still holds the lock; deployment was not started') from None
+            time.sleep(.2)
+    try:
+        yield
+    finally:
+        lock.__exit__(None,None,None)
 
 
 def backup_database(path: Path, directory: Path) -> Path:
@@ -64,7 +85,7 @@ def main():
     subprocess.run(['launchctl','bootout',target],capture_output=True)
     data = ROOT/'data'
     data.mkdir(mode=0o700,exist_ok=True)
-    with InstanceLock(data/'bot.lock'):
+    with installation_lock(data/'bot.lock'):
         backup = backup_database(data/'bot.sqlite3',data/'backups') if (data/'bot.sqlite3').exists() else None
         plist_path = Path.home()/'Library'/'LaunchAgents'/f'{LABEL}.plist'
         plist_path.parent.mkdir(parents=True,exist_ok=True)

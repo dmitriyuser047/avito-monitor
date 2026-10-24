@@ -175,3 +175,30 @@ def test_source_startup_failure_keeps_telegram_and_worker_independent_and_closes
     asyncio.run(avito_bot.run())
     assert 'browser closed' in events and 'telegram closed' in events and 'delivery closed' in events
     instances[0].bot.session.close.assert_awaited_once()
+
+
+def test_service_installation_waits_for_old_instance_cleanup(tmp_path,monkeypatch):
+    from avito_bot import service
+    calls=[]
+    class FinishingLock:
+        def __init__(self,path):pass
+        def __enter__(self):
+            calls.append('enter')
+            if calls.count('enter')<3:raise BlockingIOError()
+        def __exit__(self,*args):calls.append('exit')
+    monkeypatch.setattr(service,'InstanceLock',FinishingLock)
+    monkeypatch.setattr(service.time,'sleep',lambda _:None)
+    with service.installation_lock(tmp_path/'lock'):
+        calls.append('installed')
+    assert calls==['enter','enter','enter','installed','exit']
+
+
+def test_service_installation_timeout_preserves_running_instance(tmp_path,monkeypatch):
+    from avito_bot import service
+    class RunningLock:
+        def __init__(self,path):pass
+        def __enter__(self):raise BlockingIOError()
+    monkeypatch.setattr(service,'InstanceLock',RunningLock)
+    with pytest.raises(RuntimeError,match='still holds the lock'):
+        with service.installation_lock(tmp_path/'lock',timeout=0):
+            pytest.fail('Must not install over a running process')

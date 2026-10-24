@@ -78,7 +78,7 @@ def test_monitor_cities_and_budget(tmp_path: Path):
     assert mon._slow_down() == 4 and mon.budget() == 4
     for _ in range(5):
         mon._slow_down()
-    assert mon.budget() == 3  # не ниже MIN_RPM
+    assert mon.budget() == 1  # не ниже MIN_RPM
 
 
 def test_city_picker_and_cards():

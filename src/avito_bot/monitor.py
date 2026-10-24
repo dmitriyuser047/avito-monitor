@@ -21,7 +21,7 @@ from .scraper import Scraper, Status
 log = logging.getLogger(__name__)
 
 BLOCK_RETRY_MINUTES = [15, 30, 60]
-MIN_RPM = 3  # ниже бюджет после блокировок не опускаем
+MIN_RPM = 1  # ниже бюджет после блокировок не опускаем
 PASS_MINUTES = 15  # капча даёт пропуск ~20 мин; блок позже этого — истёк пропуск, а не частота
 EMPTY_ALERT_AFTER = 3
 ERROR_ALERT_AFTER = 5

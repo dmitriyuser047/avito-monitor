@@ -102,6 +102,34 @@ class DB:
                 cooldown_until REAL,
                 item_ids_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS source_observations (
+                source_id TEXT NOT NULL,
+                city TEXT NOT NULL,
+                item_id INTEGER NOT NULL,
+                published_at REAL,
+                first_seen_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL,
+                matched INTEGER NOT NULL,
+                baseline INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(source_id,city,item_id)
+            );
+            CREATE TABLE IF NOT EXISTS studies (
+                id INTEGER PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                ends_at REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                filters_json TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_running_study
+                ON studies(source_id) WHERE status='running';
+            CREATE TABLE IF NOT EXISTS study_samples (
+                study_id INTEGER NOT NULL,
+                sampled_at REAL NOT NULL,
+                state TEXT NOT NULL,
+                queue_json TEXT NOT NULL,
+                PRIMARY KEY(study_id,sampled_at)
+            );
             """
         )
         columns = {r[1] for r in self.conn.execute("PRAGMA table_info(subscriptions)")}

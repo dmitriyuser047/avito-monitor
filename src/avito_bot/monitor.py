@@ -10,6 +10,7 @@ from .config import Config, feed_url
 from .db import DB
 from .matcher import classify, is_fresh, matches
 from .sources import FetchResult, FetchStatus, Source, SourceState
+from .study import StudyRecorder
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,27 @@ class Monitor:
         self._source_stopped = False
         self._wake = asyncio.Event()
         self._source_lock = asyncio.Lock()
+        self.study = StudyRecorder(db, cfg.data_dir)
+        # Upgrade an already repeated cooldown from the previous release without
+        # spending another request to discover the same restriction.
+        self._restored_restriction = False
+        if self._rate_limit_streak() >= 2:
+            for state in db.source_states(self.source_id):
+                if state['state'] == SourceState.COOLDOWN:
+                    db.save_source_state(self.source_id, state['city'], SourceState.WAITING_FOR_USER,
+                                         state['next_allowed_at'], 'repeated HTTP 429')
+                    self._restored_restriction = True
+
+    def _rate_limit_streak(self) -> int:
+        saved = self.db.get(f'rate_limit_streak:{self.source_id}')
+        if saved is not None:
+            return int(saved)
+        previous_ok_id = self.db.conn.execute(
+            "SELECT COALESCE(MAX(id),0) FROM fetch_metrics WHERE source_id=? AND status IN ('ok','no_results')",
+            (self.source_id,)).fetchone()[0]
+        return self.db.conn.execute(
+            "SELECT COUNT(*) FROM fetch_metrics WHERE source_id=? AND id>? AND status='rate_limited'",
+            (self.source_id,previous_ok_id)).fetchone()[0]
 
     def budget(self) -> float:
         start, end = self.cfg.night_hours
@@ -87,6 +109,14 @@ class Monitor:
             return await self._poll_once()
 
     async def _poll_once(self) -> bool:
+        if self._restored_restriction:
+            self._restored_restriction = False
+            await self.alert('Повторные ограничения Авито\nОпрос остановлен по истории предыдущих попыток. '
+                             'Проверьте /health. После обязательной паузы потребуется ручное возобновление.')
+        try:
+            self.study.tick(self)
+        except Exception:
+            log.exception('Passive study recording failed; source scheduling continues')
         if hasattr(self.scraper, 'cleanup_debug'):
             self.scraper.cleanup_debug()
         try:
@@ -146,10 +176,24 @@ class Monitor:
             self.last_ok = result.observed_at
             self._errors[city] = 0
             self.db.set(f'errors:{self.source_id}:{city}', '0')
+            self.db.set(f'rate_limit_streak:{self.source_id}', '0')
             self.db.save_source_state(self.source_id, city, SourceState.ACTIVE)
             items = [i for i in result.items if i.feed in self.cfg.sections]
             for item in items:
                 item.city = city
+            subs = self.db.subscriptions(only_enabled=True)
+            observation_key = f'observation_seed:{self.source_id}:{city}'
+            baseline = self.db.get(observation_key) is None
+            with self.db.conn:
+                for item in items:
+                    matched_now = is_fresh(item, result.observed_at) and any(
+                        city in (s.cities or [self.cfg.city]) and matches(item, s) for s in subs)
+                    self.db.conn.execute(
+                        'INSERT INTO source_observations VALUES (?,?,?,?,?,?,?,?) '
+                        'ON CONFLICT(source_id,city,item_id) DO UPDATE SET last_seen_at=excluded.last_seen_at',
+                        (self.source_id, city, item.id, item.published, result.observed_at,
+                         result.observed_at, int(matched_now), int(baseline)))
+                self.db.conn.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (observation_key,'1'))
             self.last_items = items
             if self.db.get(f'feed:{url}') is None:
                 # Seed existing listings; preserve the legacy baseline key.
@@ -167,11 +211,18 @@ class Monitor:
                 self.db.set(f'coverage:{self.source_id}:{city}', 'ok')
         elif status is FetchStatus.RATE_LIMITED:
             until = time.time() + max(self.cfg.cooldown_seconds, result.retry_after_sec or 0)
-            changed = self.db.save_source_state(self.source_id, city, SourceState.COOLDOWN, until, 'HTTP 429')
-            self.status = 'COOLDOWN: Авито ограничил частоту'
+            streak = self._rate_limit_streak() + 1
+            self.db.set(f'rate_limit_streak:{self.source_id}', str(streak))
+            state = SourceState.WAITING_FOR_USER if streak >= 2 else SourceState.COOLDOWN
+            changed = self.db.save_source_state(self.source_id, city, state, until,
+                                                'repeated HTTP 429' if streak >= 2 else 'HTTP 429')
+            self.status = state + ': Авито ограничил частоту'
             if changed:
-                await self.alert('Авито ограничил частоту\nОпрос остановлен до '
-                                 + datetime.fromtimestamp(until).strftime('%d.%m %H:%M') + '. Очередь Telegram работает.')
+                await self.alert('Авито ограничил частоту\n'
+                                 + ('Повторное ограничение: автоматический опрос полностью остановлен. '
+                                    'После окончания паузы потребуется /unblock или /resume.\n' if streak >= 2 else '')
+                                 + 'Пауза минимум до ' + datetime.fromtimestamp(until).strftime('%d.%m %H:%M')
+                                 + '. Очередь Telegram работает.')
         elif status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
             until = time.time() + result.retry_after_sec if result.retry_after_sec else None
             changed = self.db.save_source_state(self.source_id, city, SourceState.WAITING_FOR_USER, until, status.value)
@@ -241,6 +292,7 @@ class Monitor:
             for state in self.db.source_states(self.source_id):
                 if state['state'] == SourceState.WAITING_FOR_USER and (state['next_allowed_at'] or 0) <= now:
                     self.db.save_source_state(self.source_id, state['city'], SourceState.ACTIVE)
+                    self.db.set(f'rate_limit_streak:{self.source_id}', '0')
         self._wake.set()
 
     async def open_verification(self) -> str:
@@ -282,4 +334,9 @@ class Monitor:
             stats = latency[metric]
             if stats:
                 lines.append(f"{label}: n={stats['n']}, p50={stats['p50']:.1f} с, p95={stats['p95']:.1f} с, ≤60 с: {stats['within_60']:.0%}")
+        study = self.db.conn.execute('SELECT id,ends_at FROM studies WHERE source_id=? AND status=\'running\'',
+                                     (self.source_id,)).fetchone()
+        if study:
+            lines.append('Наблюдение №' + str(study[0]) + ': идёт до '
+                         + datetime.fromtimestamp(study[1]).strftime('%d.%m %H:%M'))
         return '\n'.join(lines)

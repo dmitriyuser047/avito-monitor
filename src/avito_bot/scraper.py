@@ -143,7 +143,9 @@ class Scraper:
                     return (Status.OK if items else Status.EMPTY), items
                 log.info("Лёгкий запрос: %s «%s» — открываю страницу целиком", res["status"], res["title"][:40])
             except Exception as e:
+                # сеть моргнула — повторим в следующем цикле, без лишней полной загрузки
                 log.warning("Лёгкий запрос не удался: %s", e)
+                return Status.ERROR, []
         self.light_ok = False
         status, items = await self.load(url)
         if status is Status.OK:

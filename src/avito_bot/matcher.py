@@ -106,14 +106,33 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+# Явно не комплектующие: если такое слово стоит в названии раньше любого раздела — «прочее»
+OTHER_NOUN = (rf"монитор|роутер|маршрутизатор|клавиатур|{B}мыш|наушник|гарнитур|колонк|акустик|джойстик|"
+              rf"геймпад|{B}руль|сумк|рюкзак|коврик|веб ?камер|вебкамер|принтер|{B}мфу{E}|сканер|{B}ибп{E}|"
+              rf"проектор|телевизор|планшет|кресл")
+
+
+def _noun_hits(title: str) -> list[tuple[int, str]]:
+    """(позиция, раздел) для явных названий. «…для компьютера», «…для процессоров» не считаются:
+    это назначение вещи, а не она сама («Монитор для компьютера», «Кулеры для процессоров»)."""
+    hits = []
+    for key, noun in [(c.key, c.noun) for c in CATEGORIES if c.noun] + [("other", OTHER_NOUN)]:
+        for m in re.finditer(noun, title):
+            if not title[max(0, m.start() - 4):m.start()].endswith("для "):
+                hits.append((m.start(), key))
+    return sorted(hits)
+
+
 def classify(item: Item) -> set[str]:
     """Разделы объявления. Комплект «мать + процессор» попадает в оба."""
     if PC_FEED in item.feed:
         return {"pc"}
     title = normalize(item.title)
-    found = {c.key for c in CATEGORIES if c.noun and re.search(c.noun, title)}
-    if found:
-        return found
+    hits = _noun_hits(title)
+    if hits:
+        if hits[0][1] == "other":
+            return {"other"}
+        return {key for _, key in hits if key != "other"}
     hints = {c.key for c in CATEGORIES if c.hint and re.search(c.hint, title)}
     if "gpu" in hints:
         hints -= {"ram", "psu"}  # «8gb gddr6», «300w» у видеокарт

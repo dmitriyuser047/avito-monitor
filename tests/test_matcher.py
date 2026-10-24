@@ -136,3 +136,17 @@ def test_wanted_ads_skipped():
 def test_typos():
     from avito_bot.matcher import classify
     assert classify(item("Razen 7 9700x")) == {"cpu"}
+
+
+def test_classify_live_mistakes():
+    """Ошибки, найденные за час наблюдения 24.10."""
+    from avito_bot.matcher import classify
+    c = lambda t: classify(item(t))
+    assert c("Монитор для компьютера") == {"other"}
+    assert c("Сетевой роутер с блоком питания и патч-кордом") == {"other"}
+    assert c("Кулеры для процессоров несколько штук") == {"cooling"}
+    assert c("Корпус для пк белый micro atx") == {"case"}
+    assert c("Блок питания для монитора") == {"psu"}
+    assert c("Клавиатура беспроводная Logitech K780") == {"other"}
+    assert c("Материнская плата + процессор +куллер") >= {"cpu", "mobo"}
+    assert c("Ddr3 sodimm для ноутбука 4GB") == {"ram"}

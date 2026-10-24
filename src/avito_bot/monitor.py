@@ -21,7 +21,8 @@ from .scraper import Scraper, Status
 log = logging.getLogger(__name__)
 
 BLOCK_RETRY_MINUTES = [15, 30, 60]
-MIN_RPM = 2  # ниже бюджет после блокировок не опускаем
+MIN_RPM = 3  # ниже бюджет после блокировок не опускаем
+PASS_MINUTES = 15  # капча даёт пропуск ~20 мин; блок позже этого — истёк пропуск, а не частота
 EMPTY_ALERT_AFTER = 3
 ERROR_ALERT_AFTER = 5
 
@@ -47,6 +48,7 @@ class Monitor:
         self._empty = 0
         self._errors = 0
         self.last_items: list[Item] = []  # для /test
+        self._unblocked_at: float | None = None
 
     # --- бюджет загрузок ---
 
@@ -176,7 +178,9 @@ class Monitor:
     async def _wait_unblock(self, url: str) -> None:
         self.status = "заблокирован Авито"
         log.warning("Авито ограничил доступ")
-        lowered = self._slow_down()
+        # блок через 15+ минут после капчи — истёк пропуск, частота тут ни при чём
+        pass_expired = self._unblocked_at and time.time() - self._unblocked_at > PASS_MINUTES * 60
+        lowered = None if pass_expired else self._slow_down()
         await self.scraper.set_window("normal")
         await self.alert(
             "Авито ограничил доступ\n"
@@ -199,6 +203,7 @@ class Monitor:
             if status is Status.OK:
                 await self.scraper.set_window("minimized")
                 self.status = "работает"
+                self._unblocked_at = time.time()
                 await self.alert("Доступ восстановлен\nСлежение продолжается.")
                 city = url.split("/")[3]
                 for item in items:

@@ -105,3 +105,23 @@ def test_members_access(tmp_path: Path):
     member_menu = [b.text for row in ui.main_menu(paused=False, status="работает", last_ok=None, active=0, total=0,
                                                     found_today=0, city="Казань", is_owner=False)[1].inline_keyboard for b in row]
     assert "Доступ" in owner_menu and "Доступ" not in member_menu
+
+
+def test_real_time_in_caption():
+    from datetime import datetime
+    from avito_bot.matcher import Item, is_fresh
+    now = datetime(2026, 10, 24, 12, 30).timestamp()
+    pub = datetime(2026, 10, 24, 11, 47).timestamp()
+    i = Item(1, "RTX 3060", 20000, "https://x", "1 час назад", None, "р-н Советский", "", "tovary_dlya_kompyutera",
+             "kazan", published=pub, found_at=pub + 120)
+    assert ui.when_text(i) == "опубликовано в 11:47"
+    i.found_at = now
+    assert ui.when_text(i) == "опубликовано в 11:47, в поиске с 12:30"
+    i.published = None
+    assert ui.when_text(i) == "появилось в поиске в 12:30"
+    assert "1 час назад" not in ui.item_caption(i, [Subscription(1, "3060", None, None, [])])
+    assert ui.clock(datetime(2026, 10, 23, 23, 10).timestamp(), now) == "вчера 23:10"
+    # свежесть — по точному времени, а не по тексту
+    old = Item(2, "x", 1, "", "1 час назад", None, "", "", published=now - 5 * 3600)
+    assert not is_fresh(old, now)
+    assert is_fresh(Item(3, "x", 1, "", "Вчера", None, "", "", published=now - 600), now)

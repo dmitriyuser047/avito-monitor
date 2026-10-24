@@ -38,13 +38,32 @@ EXTRACT_FN = """(root) => [...root.querySelectorAll('[data-marker="catalog-serp"
   };
 })"""
 
+# Точное время публикации есть только в служебном JSON страницы (script type="mime/invalid"):
+# у объявлений поле sortTimeStamp, мс. Ищем все объекты с id и sortTimeStamp.
+TIMES_FN = """(root) => {
+  const out = {};
+  const walk = (o, depth) => {
+    if (!o || typeof o !== 'object' || depth > 25) return;
+    if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+    if (o.id && o.sortTimeStamp) out[o.id] = o.sortTimeStamp;
+    for (const k in o) walk(o[k], depth + 1);
+  };
+  for (const s of root.querySelectorAll('script[type="mime/invalid"]')) {
+    try { walk(JSON.parse(s.textContent), 0); } catch (e) {}
+  }
+  return out;
+}"""
+
 # Лёгкий опрос: один запрос HTML ленты из уже открытой страницы Авито (те же cookies и
 # отпечаток настоящего браузера), без загрузки 350 картинок, скриптов и аналитики.
-LIGHT_JS = f"""async (url) => {{
+LIGHT_JS = f"""async ([url, wantHtml]) => {{
   const r = await fetch(url, {{credentials: 'include', cache: 'no-store',
                                headers: {{'accept': 'text/html,application/xhtml+xml'}}}});
-  const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
-  return {{status: r.status, url: r.url, title: doc.title, items: ({EXTRACT_FN})(doc)}};
+  const html = await r.text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const items = ({EXTRACT_FN})(doc), times = ({TIMES_FN})(doc);
+  for (const i of items) i.ts = times[i.id] || null;
+  return {{status: r.status, url: r.url, title: doc.title, items, html: wantHtml ? html : null}};
 }}"""
 
 
@@ -66,6 +85,7 @@ class Scraper:
         self.page: Page | None = None
         self._final_url: dict[str, str] = {}  # адрес ленты после редиректа Авито
         self.light_ok = False  # открыта ли страница Авито, из которой можно делать лёгкие запросы
+        self.sample_path: Path | None = profile_dir.parent / "feed_sample.html"
 
     async def start(self) -> None:
         self._pw = await async_playwright().start()
@@ -113,7 +133,10 @@ class Scraper:
         """Лента: лёгким запросом, а если Авито просит проверку — полной загрузкой страницы."""
         if self.light_ok:
             try:
-                res = await self.page.evaluate(LIGHT_JS, self._final_url.get(url, url))
+                res = await self.page.evaluate(LIGHT_JS, [self._final_url.get(url, url), self.sample_path is not None])
+                if res.get("html") and self.sample_path:
+                    self.sample_path.write_text(res["html"], encoding="utf-8")  # один образец для диагностики
+                    self.sample_path = None
                 if res["status"] == 200 and "Доступ ограничен" not in res["title"]:
                     self._final_url[url] = res["url"]
                     items = [_to_item(r) for r in res["items"] if r.get("id")]
@@ -176,7 +199,9 @@ class Scraper:
             title = await self.page.title()
             if "Доступ ограничен" in title:
                 return Status.BLOCKED, []
-            raw = await self.page.evaluate(f"({EXTRACT_FN})(document)")
+            raw = await self.page.evaluate(
+                f"(() => {{ const items = ({EXTRACT_FN})(document), times = ({TIMES_FN})(document);"
+                f" for (const i of items) i.ts = times[i.id] || null; return items; }})()")
         except Exception as e:
             log.warning("Ошибка разбора страницы: %s", e)
             return Status.ERROR, []
@@ -199,6 +224,7 @@ def _to_item(r: dict) -> Item:
         image=r.get("image"),
         location=r["location"],
         description=r["description"],
+        published=r["ts"] / 1000 if r.get("ts") else None,
         feed=parts[1] if len(parts) > 2 else "",  # раздел из адреса объявления
         city=parts[0] if len(parts) > 2 else "",
     )

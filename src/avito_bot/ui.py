@@ -7,6 +7,7 @@
 
 import html
 import time
+from datetime import datetime
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -87,6 +88,29 @@ def price_range(min_price: int | None, max_price: int | None) -> str:
 
 def minus_text(words: list[str]) -> str:
     return ", ".join(MINUS_LABELS.get(w, w) for w in words) if words else "нет"
+
+
+def clock(ts: float, now: float | None = None) -> str:
+    """11:47 сегодня, «вчера 23:10», иначе «22.10 18:05»."""
+    t, today = datetime.fromtimestamp(ts), datetime.fromtimestamp(now or time.time()).date()
+    if t.date() == today:
+        return t.strftime("%H:%M")
+    if (today - t.date()).days == 1:
+        return "вчера " + t.strftime("%H:%M")
+    return t.strftime("%d.%m %H:%M")
+
+
+def when_text(item: Item) -> str:
+    """Реальное время вместо «1 час назад»."""
+    if item.published:
+        text = f"опубликовано в {clock(item.published)}"
+        # после модерации объявление может попасть в поиск заметно позже
+        if item.found_at and item.found_at - item.published > 10 * 60:
+            text += f", в поиске с {clock(item.found_at)}"
+        return text
+    if item.found_at:
+        return f"появилось в поиске в {clock(item.found_at)}"
+    return item.date
 
 
 def ago(ts: float | None) -> str:
@@ -412,13 +436,14 @@ def wiz_confirm(query: str, pmin: int | None, pmax: int | None, minus: list[str]
 def item_caption(item: Item, subs: list[Subscription]) -> str:
     price = f"{money(item.price)} ₽" if item.price is not None else "цена не указана"
     place = city_name(item.city) if item.city and item.city != DEFAULT_CITY else ""
-    meta = " · ".join(x for x in (html.escape(place), html.escape(item.location), html.escape(item.date)) if x)
+    meta = " · ".join(x for x in (html.escape(place), html.escape(item.location)) if x)
     queries = ", ".join(html.escape(sub_title(s.query, s.category)) for s in subs)
     desc = html.escape(item.description[:220]).strip()
     return (
         f"<b>{html.escape(item.title)}</b>\n"
         f"<b>{price}</b>\n"
-        f"{meta}\n"
+        + (f"{meta}\n" if meta else "")
+        + f"{when_text(item)}\n"
         + (f"\n<blockquote expandable>{desc}</blockquote>\n" if desc else "\n")
         + f"Запрос: {queries}"
     )

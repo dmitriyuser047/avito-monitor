@@ -9,6 +9,7 @@
 """
 
 import re
+import time
 from dataclasses import dataclass
 
 from .db import Subscription
@@ -33,8 +34,10 @@ class Item:
     image: str | None
     location: str
     description: str
-    feed: str = ""  # из какой ленты пришло
+    feed: str = ""  # раздел из адреса объявления
     city: str = ""  # город ленты, как в адресе Авито
+    published: float | None = None  # точное время публикации (unix), если Авито его отдал
+    found_at: float | None = None  # когда бот впервые увидел объявление
 
 
 @dataclass(frozen=True)
@@ -190,7 +193,12 @@ def matches(item: Item, sub: Subscription) -> bool:
     return True
 
 
-def is_fresh(item: Item) -> bool:
+FRESH_HOURS = 3
+
+
+def is_fresh(item: Item, now: float | None = None) -> bool:
+    if item.published:
+        return (now or time.time()) - item.published < FRESH_HOURS * 3600
     return bool(FRESH_DATE.search(item.date))
 
 

@@ -137,17 +137,21 @@ class Monitor:
         if not new_ids:
             return
         self.db.mark_seen(list(new_ids))
-        self._log_items([i for i in items if i.id in new_ids])
+        self._log_items([i for i in items if i.id in new_ids])  # до found_at: в логе есть seen_at
         subs = self.db.subscriptions(only_enabled=True)
+        now = time.time()
         for item in items:
             city_subs = [s for s in subs if item.city in (s.cities or [self.cfg.city])]
             if item.id not in new_ids:
                 continue
+            item.found_at = now
             if not is_fresh(item):
                 log.info("Пропуск (не свежее): %s | %s | %s", item.id, item.date, item.title)
                 continue
             matched = [s for s in city_subs if matches(item, s)]
-            log.info("Новое: %s | %s | %s ₽ | совпадений: %d", item.date, item.title, item.price, len(matched))
+            published = datetime.fromtimestamp(item.published).strftime("%H:%M") if item.published else "?"
+            log.info("Новое: %s (опубл. %s) | %s | %s ₽ | совпадений: %d",
+                     item.date, published, item.title, item.price, len(matched))
             if matched:
                 await self.send_item(item, matched)
                 self.db.record_notification(item.id, [s.id for s in matched])

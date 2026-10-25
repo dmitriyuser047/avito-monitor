@@ -202,3 +202,23 @@ def test_service_installation_timeout_preserves_running_instance(tmp_path,monkey
     with pytest.raises(RuntimeError,match='still holds the lock'):
         with service.installation_lock(tmp_path/'lock',timeout=0):
             pytest.fail('Must not install over a running process')
+
+
+def test_service_waits_until_launchd_removes_previous_job(monkeypatch):
+    from avito_bot import service
+    results=iter([SimpleNamespace(returncode=0),SimpleNamespace(returncode=0),SimpleNamespace(returncode=1)])
+    calls=[]
+    def run(command,**kwargs):
+        calls.append(command)
+        return next(results)
+    monkeypatch.setattr(service.subprocess,'run',run)
+    monkeypatch.setattr(service.time,'sleep',lambda _:None)
+    service.wait_for_unload('gui/501/test-job')
+    assert calls==[['launchctl','print','gui/501/test-job']]*3
+
+
+def test_service_unload_timeout_prevents_bootstrap(monkeypatch):
+    from avito_bot import service
+    monkeypatch.setattr(service.subprocess,'run',lambda *args,**kwargs:SimpleNamespace(returncode=0))
+    with pytest.raises(RuntimeError,match='still unloading'):
+        service.wait_for_unload('gui/501/test-job',timeout=0)

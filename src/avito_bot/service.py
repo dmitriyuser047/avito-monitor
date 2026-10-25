@@ -18,6 +18,18 @@ from .runtime import InstanceLock
 LABEL = 'local.avito-monitor'
 
 
+def wait_for_unload(target: str, timeout: float = 25) -> None:
+    """A released application lock does not mean launchd removed its old job."""
+    deadline = time.monotonic() + timeout
+    while True:
+        result = subprocess.run(['launchctl','print',target],capture_output=True)
+        if result.returncode:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Previous LaunchAgent is still unloading; deployment was not started')
+        time.sleep(.2)
+
+
 @contextmanager
 def installation_lock(path: Path, timeout: float = 25):
     """launchctl bootout returns before the application's cleanup always ends."""
@@ -83,6 +95,7 @@ def main():
     # Re-deployment first stops only our registered service. A manually started bot
     # is protected by the OS lock and must not be killed by a broad process match.
     subprocess.run(['launchctl','bootout',target],capture_output=True)
+    wait_for_unload(target)
     data = ROOT/'data'
     data.mkdir(mode=0o700,exist_ok=True)
     with installation_lock(data/'bot.lock'):
@@ -94,6 +107,9 @@ def main():
         revision = subprocess.run(['git','rev-parse','HEAD'],cwd=ROOT,capture_output=True,text=True,check=True).stdout.strip()
         manifest = {'revision':revision, 'backup':str(backup) if backup else None,
                     'deployed_at':datetime.now().astimezone().isoformat()}
-        (data/'deployment.json').write_text(json.dumps(manifest,indent=2)+'\n')
     subprocess.run(['launchctl','bootstrap',domain,str(plist_path)],check=True)
+    # A rejected bootstrap must not be recorded as a completed deployment.
+    pending = data/'deployment.json.tmp'
+    pending.write_text(json.dumps(manifest,indent=2)+'\n')
+    pending.replace(data/'deployment.json')
     print(f'Deployed {revision[:12]}; backup: {backup}; service: {LABEL}')

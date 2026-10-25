@@ -38,7 +38,8 @@ async def run() -> None:
                 raise SystemExit(78)
             db.set('owner_id', str(tg.owner_id))
         scraper = Scraper(cfg.data_dir / 'browser-profile', None, cfg.headless,
-                          cfg.save_debug_html, cfg.debug_html_retention_hours)
+                          cfg.save_debug_html, cfg.debug_html_retention_hours,
+                          cfg.browser_engine, cfg.fetch_mode, cfg.browser_channel)
         async def console_alert(text):
             log.info('[alert] %s', text)
         monitor = Monitor(cfg, db, scraper, tg.alert if tg else console_alert,

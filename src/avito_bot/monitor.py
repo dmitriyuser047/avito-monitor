@@ -1,5 +1,6 @@
 """Persistent source scheduler. Collection never waits for Telegram item delivery."""
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -164,8 +165,22 @@ class Monitor:
         await self._handle(result, url)
         return True
 
-    async def _handle(self, result: FetchResult, url: str) -> None:
+    async def _handle(self, result: FetchResult, url: str, operation: str = 'automatic') -> None:
         status, city = result.status, result.city
+        diagnostic_names = ('browser_engine', 'browser_channel', 'fetch_mode', 'actual_mode', 'run_id',
+                            'duration_sec', 'request_count', 'transferred_bytes', 'access_limited')
+        diagnostics = {name: result.diagnostics.get(name) for name in diagnostic_names}
+        context = dict(feed=self.cfg.feed, sections=self.cfg.sections,
+                       subscriptions=[asdict(s) for s in self.db.subscriptions(only_enabled=True)],
+                       city=self.cfg.city, rpm=self.cfg.requests_per_minute,
+                       night_rpm=self.cfg.night_requests_per_minute, night_hours=self.cfg.night_hours,
+                       cooldown=self.cfg.cooldown_seconds, headless=self.cfg.headless,
+                       direct_interface=self.cfg.direct_interface)
+        # A hash lets reports detect different filters/budgets without exporting query text.
+        context_id = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:16]
+        collection = {name: diagnostics[name] for name in
+                      ('browser_engine', 'browser_channel', 'fetch_mode', 'actual_mode', 'run_id')}
+        collection.update(comparison_context=context_id, operation=operation)
         until = None
         matched = 0
         previous = self.db.latest_snapshot(self.source_id, city)
@@ -200,7 +215,7 @@ class Monitor:
                 self.db.mark_seen([i.id for i in items])
                 self.db.set(f'feed:{url}', '1')
             else:
-                matched = self._process(items, result.observed_at)
+                matched = self._process(items, result.observed_at, collection)
             if ids and previous and previous[0] and overlap == 0:
                 key = f'coverage:{self.source_id}:{city}'
                 if self.db.get(key) != 'gap':
@@ -249,12 +264,14 @@ class Monitor:
                              status=status.value, http_status=result.http_status,
                              raw_count=result.diagnostics.get('raw_count', len(result.items)), matched_count=matched,
                              overlap_count=overlap, interval_sec=(result.observed_at - previous[1]) if previous else None,
-                             cooldown_until=until, item_ids_json=json.dumps(sorted(ids)))
+                             cooldown_until=until, item_ids_json=json.dumps(sorted(ids)),
+                             **diagnostics, budget_rpm=self.budget(), comparison_context=context_id,
+                             operation=operation)
         log.info('Fetch source=%s city=%s status=%s http=%s raw=%s matched=%s overlap=%s cooldown_until=%s',
                  self.source_id, city, status.value, result.http_status,
                  result.diagnostics.get('raw_count', len(result.items)), matched, overlap, until)
 
-    def _process(self, items, observed_at: float) -> int:
+    def _process(self, items, observed_at: float, collection: dict | None = None) -> int:
         subs = self.db.subscriptions(only_enabled=True)
         entries, matched_count = [], 0
         unseen = self.db.unseen([i.id for i in items])
@@ -266,6 +283,8 @@ class Monitor:
             matched = [s for s in subs if item.city in (s.cities or [self.cfg.city]) and matches(item, s)] if is_fresh(item) else []
             matched_count += bool(matched)
             payload = {'item': asdict(item), 'subs': [asdict(s) for s in matched], 'source_id': self.source_id}
+            if collection:
+                payload['collection'] = collection
             entries.append((item.id, payload, recipients if matched else []))
         inserted = self.db.stage_items(entries, observed_at)
         # Diagnostic files are never part of the delivery transaction.
@@ -315,7 +334,7 @@ class Monitor:
         city = waiting[0]['city']
         result = await self.scraper.load(feed_url(city, self.cfg.feed))
         self.db.set(f'next_poll:{self.source_id}', str(time.time() + self.delay()))
-        await self._handle(result, feed_url(city, self.cfg.feed))
+        await self._handle(result, feed_url(city, self.cfg.feed), operation='manual')
         return 'Страница открыта по вашему запросу. Пройдите проверку в браузере, затем отправьте /resume.'
 
     def health_text(self) -> str:
@@ -326,6 +345,9 @@ class Monitor:
                  'Последняя проверка: ' + (datetime.fromtimestamp(self.last_ok).strftime('%d.%m %H:%M:%S') if self.last_ok else 'ещё не было'),
                  f'Фактический интервал: {self.last_interval_sec:.1f} с' if self.last_interval_sec else 'Фактический интервал: ещё не измерен',
                  'Очередь: ' + str(self.db.queue_counts())]
+        if hasattr(self.scraper, 'browser_engine'):
+            lines.append(f'Браузер: {self.scraper.browser_engine}/{self.scraper.browser_channel}, '
+                         f'режим: {self.scraper.fetch_mode}')
         for s in states:
             until = datetime.fromtimestamp(s['next_allowed_at']).strftime('%d.%m %H:%M:%S') if s['next_allowed_at'] else '—'
             lines.append(html.escape(f"{s['city']}: {s['state']} ({s['reason']}), до {until}"))

@@ -23,7 +23,9 @@ async def run() -> None:
         if cfg.direct_interface:
             proxy = DirectProxy(cfg.direct_interface)
             await proxy.start()
-        scraper = Scraper(cfg.data_dir / 'browser-profile', proxy.url if proxy else None, headless=False)
+        scraper = Scraper(cfg.data_dir / 'browser-profile', proxy.url if proxy else None, headless=False,
+                          browser_engine=cfg.browser_engine, fetch_mode=cfg.fetch_mode,
+                          browser_channel=cfg.browser_channel)
         await scraper.start()
         await scraper.set_window('normal')
         waiting = next((s['city'] for s in states if s['state'] == SourceState.WAITING_FOR_USER), cfg.city)

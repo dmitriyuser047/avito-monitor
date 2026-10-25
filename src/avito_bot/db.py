@@ -8,6 +8,16 @@ from datetime import datetime
 from pathlib import Path
 
 
+# Additive migration: historical measurements stay unknown, never guessed.
+FETCH_DIAGNOSTIC_COLUMNS = {
+    'browser_engine': 'TEXT', 'browser_channel': 'TEXT', 'fetch_mode': 'TEXT',
+    'actual_mode': 'TEXT', 'run_id': 'TEXT', 'duration_sec': 'REAL',
+    'request_count': 'INTEGER', 'transferred_bytes': 'INTEGER',
+    'access_limited': 'INTEGER', 'budget_rpm': 'REAL', 'comparison_context': 'TEXT',
+    'operation': "TEXT NOT NULL DEFAULT 'automatic'",
+}
+
+
 @dataclass
 class Subscription:
     id: int
@@ -139,6 +149,10 @@ class DB:
             self.conn.execute("ALTER TABLE subscriptions ADD COLUMN category TEXT NOT NULL DEFAULT ''")
         if "city" not in columns:
             self.conn.execute("ALTER TABLE subscriptions ADD COLUMN city TEXT NOT NULL DEFAULT ''")
+        metrics_columns = {r[1] for r in self.conn.execute('PRAGMA table_info(fetch_metrics)')}
+        for name, declaration in FETCH_DIAGNOSTIC_COLUMNS.items():
+            if name not in metrics_columns:
+                self.conn.execute(f'ALTER TABLE fetch_metrics ADD COLUMN {name} {declaration}')
         self.conn.commit()
 
     # --- подписки ---
@@ -294,11 +308,15 @@ class DB:
         return (set(json.loads(row[0])), row[1]) if row else None
 
     def record_fetch(self, **values) -> None:
+        for name in FETCH_DIAGNOSTIC_COLUMNS:
+            values.setdefault(name, 'automatic' if name == 'operation' else None)
+        extra = ','.join(FETCH_DIAGNOSTIC_COLUMNS)
+        params = ','.join(':' + name for name in FETCH_DIAGNOSTIC_COLUMNS)
         with self.conn:
             self.conn.execute("INSERT INTO fetch_metrics (source_id,city,fetched_at,status,http_status,"
-                              "raw_count,matched_count,overlap_count,interval_sec,cooldown_until,item_ids_json)"
+                              f"raw_count,matched_count,overlap_count,interval_sec,cooldown_until,item_ids_json,{extra})"
                               " VALUES (:source_id,:city,:fetched_at,:status,:http_status,:raw_count,"
-                              ":matched_count,:overlap_count,:interval_sec,:cooldown_until,:item_ids_json)", values)
+                              f":matched_count,:overlap_count,:interval_sec,:cooldown_until,:item_ids_json,{params})", values)
 
     def latency_stats(self) -> dict:
         rows = self.conn.execute("SELECT o.sent_at,i.first_seen_at,i.payload_json FROM notification_outbox o"

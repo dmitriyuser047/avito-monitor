@@ -62,6 +62,9 @@ class Config:
     save_debug_html: bool = False
     debug_html_retention_hours: float = 24
     cooldown_seconds: float = 900
+    browser_engine: str = 'playwright'
+    fetch_mode: str = 'light_fetch'
+    browser_channel: str = 'chrome'
 
     @property
     def feed_url(self) -> str:
@@ -87,7 +90,15 @@ def load_config() -> Config:
         save_debug_html=os.environ.get("SAVE_DEBUG_HTML", "0") == "1",
         debug_html_retention_hours=float(os.environ.get("DEBUG_HTML_RETENTION_HOURS", "24")),
         cooldown_seconds=float(os.environ.get("COOLDOWN_SECONDS", "900")),
+        browser_engine=os.environ.get('BROWSER_ENGINE', 'playwright').strip().lower(),
+        fetch_mode=os.environ.get('FETCH_MODE', 'light_fetch').strip().lower(),
+        browser_channel=os.environ.get('BROWSER_CHANNEL', 'chrome').strip().lower(),
     )
+    for name, allowed in (('browser_engine', ('playwright', 'patchright')),
+                          ('fetch_mode', ('light_fetch', 'page_navigation')),
+                          ('browser_channel', ('chrome', 'chromium'))):
+        if getattr(cfg, name) not in allowed:
+            raise ValueError(f'{name} must be one of: {", ".join(allowed)}')
     for name in ('requests_per_minute', 'night_requests_per_minute', 'cooldown_seconds', 'debug_html_retention_hours'):
         value = getattr(cfg, name)
         if not math.isfinite(value) or value <= 0:

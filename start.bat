@@ -16,7 +16,7 @@ if errorlevel 1 (
 )
 
 echo == Проверяю зависимости
-uv sync --frozen --no-dev
+uv sync --frozen --no-dev --inexact
 if errorlevel 1 goto fail
 uv run playwright install chromium
 if errorlevel 1 goto fail

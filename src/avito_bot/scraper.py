@@ -1,15 +1,12 @@
-"""Настоящий браузер (Playwright) с постоянным профилем: открывает ленты
-Авито и достаёт объявления из страницы.
+"""Persistent browser source with selectable engine and collection mode.
 
-Headless Авито распознаёт, поэтому окно обычное, но свёрнутое. Когда Авито
-показывает «Доступ ограничен», окно разворачивается — капчу проходит человек.
-
-Предпочитаем установленный Google Chrome без флага --enable-automation: капча
-(GeeTest/hCaptcha) в тестовом Chromium под автоматизацией может не запуститься.
-Если Chrome нет — встроенный Chromium.
+Restrictions are handled by Monitor using one source identity across all settings.
+Browser/profile selection is explicit; launch failures never trigger a fallback.
 """
 
 import logging
+import importlib
+import uuid
 import asyncio
 import math
 import time
@@ -17,7 +14,7 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 from pathlib import Path
 
-from playwright.async_api import BrowserContext, Page, async_playwright
+from .runtime import InstanceLock
 
 from .matcher import Item
 from .sources import FetchResult, FetchStatus
@@ -81,10 +78,12 @@ INSPECT_FN = f"""(root) => {{
 LIGHT_JS = f"""async ([url, wantHtml]) => {{
   const r = await fetch(url, {{credentials: 'include', cache: 'no-store',
     signal: AbortSignal.timeout(25000), headers: {{'accept': 'text/html,application/xhtml+xml'}}}});
+  const meta = {{status: r.status, url: r.url, retry_after: r.headers.get('retry-after')}};
+  if ([403, 429, 439].includes(r.status)) return {{...meta, items: []}};
   const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
   const out = ({INSPECT_FN})(doc);
   // Debug output deliberately excludes scripts, form values, cookies and full HTML.
-  return {{...out, status: r.status, url: r.url, retry_after: r.headers.get('retry-after'),
+  return {{...out, ...meta,
     html: wantHtml ? '<html><head><title>' + doc.title.replace(/[<>]/g, '') + '</title></head><body>'
       + '<p>catalog=' + out.catalog + ', items=' + out.items.length + '</p></body></html>' : null}};
 }}"""
@@ -141,11 +140,27 @@ class Scraper:
     source_id = 'local_browser'
 
     def __init__(self, profile_dir: Path, proxy_url: str | None, headless: bool = False,
-                 save_debug_html: bool = False, debug_retention_hours: float = 24):
+                 save_debug_html: bool = False, debug_retention_hours: float = 24,
+                 browser_engine: str = 'playwright', fetch_mode: str = 'light_fetch',
+                 browser_channel: str = 'chrome'):
         self.profile_dir, self.proxy_url, self.headless = profile_dir, proxy_url, headless
+        if browser_engine not in ('playwright', 'patchright'):
+            raise ValueError('Unknown browser engine')
+        if fetch_mode not in ('light_fetch', 'page_navigation'):
+            raise ValueError('Unknown fetch mode')
+        if browser_channel not in ('chrome', 'chromium'):
+            raise ValueError('Unknown browser channel')
+        self.browser_engine, self.fetch_mode, self.browser_channel = browser_engine, fetch_mode, browser_channel
+        # Keep the original Playwright paths, so rollback reuses its own session.
+        base = profile_dir if browser_engine == 'playwright' else profile_dir.with_name(profile_dir.name + '-patchright')
+        self.user_data_dir = base.with_name(base.name + '-chrome') if browser_channel == 'chrome' else base
+        self._browser_lock = None
+        self._network = None
+        self._request_count = self._transferred_bytes = 0
+        self.run_id = uuid.uuid4().hex
         self._pw = None
-        self.ctx: BrowserContext | None = None
-        self.page: Page | None = None
+        self.ctx = None
+        self.page = None
         self._final_url: dict[str, str] = {}
         self.light_ok = False
         self._closed = False
@@ -167,35 +182,98 @@ class Scraper:
         return self._closed or bool(self.page and self.page.is_closed())
 
     async def start(self) -> None:
-        self._pw = await async_playwright().start()
-        options = dict(headless=self.headless, proxy={'server': self.proxy_url} if self.proxy_url else None,
-                       locale='ru-RU', timezone_id='Europe/Moscow', no_viewport=True,
-                       args=['--window-size=1400,900'])
+        if self._pw or self.ctx:
+            raise RuntimeError('Browser already started')
         try:
+            api = importlib.import_module(f'{self.browser_engine}.async_api')
+        except ImportError as exc:
+            command = 'uv sync --frozen --extra experimental' if self.browser_engine == 'patchright' else 'uv sync --frozen'
+            log.error('Selected engine %s is unavailable. Install it: %s', self.browser_engine, command)
+            raise RuntimeError(f'Selected engine {self.browser_engine} is not installed; run {command}') from exc
+        self.profile_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = InstanceLock(self.profile_dir.parent / 'browser.lock')
+        try:
+            lock.__enter__()
+        except BlockingIOError:
+            raise RuntimeError('Another browser engine is running; stop it first') from None
+        self._browser_lock = lock
+        try:
+            self.user_data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.user_data_dir.chmod(0o700)
+            self._closed = False
+            self.light_ok = False
+            self._final_url.clear()
+            self.run_id = uuid.uuid4().hex
+            self._pw = await api.async_playwright().start()
             self.ctx = await self._pw.chromium.launch_persistent_context(
-                str(self.profile_dir.with_name(self.profile_dir.name + '-chrome')), channel='chrome', **options)
-            log.info('Браузер: Google Chrome')
-        except Exception as exc:
-            message = str(exc).lower()
-            if 'executable' not in message and 'distribution' not in message:
-                raise  # a locked/broken profile is not permission to switch sessions
-            self.ctx = await self._pw.chromium.launch_persistent_context(str(self.profile_dir), channel='chromium', **options)
-            log.info('Браузер: Chromium')
-        self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
-        self.ctx.on('close', lambda _: setattr(self, '_closed', True))
-        self.page.on('close', lambda _: setattr(self, '_closed', True))
-        for directory in (self.profile_dir, self.profile_dir.with_name(self.profile_dir.name + '-chrome')):
-            if directory.exists():
-                directory.chmod(0o700)
-        await self.set_window('minimized')
+                str(self.user_data_dir), channel=self.browser_channel, headless=self.headless,
+                proxy={'server': self.proxy_url} if self.proxy_url else None,
+                locale='ru-RU', timezone_id='Europe/Moscow', no_viewport=True,
+                args=['--window-size=1400,900'])
+            log.info('Browser engine=%s channel=%s mode=%s',
+                     self.browser_engine, self.browser_channel, self.fetch_mode)
+            self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
+            self.ctx.on('close', lambda *_: setattr(self, '_closed', True))
+            self.page.on('close', lambda *_: setattr(self, '_closed', True))
+            await self._start_network_metrics()
+            await self.set_window('minimized')
+        except BaseException:
+            log.error('Cannot start %s/%s; check browser installation and profile access. No fallback was attempted.',
+                      self.browser_engine, self.browser_channel)
+            await self.stop()
+            raise
+
+    async def _start_network_metrics(self) -> None:
+        session = None
+        self._request_count = self._transferred_bytes = 0
+        try:
+            session = await self.ctx.new_cdp_session(self.page)
+            session.on('Network.requestWillBeSent', self._count_request)
+            session.on('Network.loadingFinished', self._count_bytes)
+            await session.send('Network.enable')
+            self._network = session
+        except Exception:
+            if session:
+                try:
+                    await session.detach()
+                except Exception:
+                    pass
+            log.warning('Passive network counters unavailable; metrics will be null')
+
+    def _count_request(self, _event) -> None:
+        self._request_count += 1
+
+    def _count_bytes(self, event) -> None:
+        self._transferred_bytes += max(0, int(event.get('encodedDataLength', 0)))
 
     async def stop(self) -> None:
         try:
-            if self.ctx:
-                await self.ctx.close()
+            try:
+                if self.ctx:
+                    await self.ctx.close()
+            finally:
+                if self._pw:
+                    await self._pw.stop()
         finally:
-            if self._pw:
-                await self._pw.stop()
+            self.ctx = self.page = self._pw = self._network = None
+            self._closed = True
+            if self._browser_lock:
+                self._browser_lock.__exit__(None, None, None)
+                self._browser_lock = None
+
+    def _measurement(self):
+        return time.monotonic(), self._request_count, self._transferred_bytes
+
+    def _measured(self, result: FetchResult, measurement, actual_mode: str) -> FetchResult:
+        started, requests, transferred = measurement
+        result.diagnostics.update(
+            browser_engine=self.browser_engine, fetch_mode=self.fetch_mode,
+            browser_channel=self.browser_channel, actual_mode=actual_mode, run_id=self.run_id,
+            duration_sec=time.monotonic() - started,
+            request_count=self._request_count - requests if self._network else None,
+            transferred_bytes=self._transferred_bytes - transferred if self._network else None,
+            access_limited=result.status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE, FetchStatus.RATE_LIMITED))
+        return result
 
     async def set_window(self, state: str) -> None:
         if self.headless or self.closed or not self.page:
@@ -215,8 +293,9 @@ class Scraper:
                     pass
 
     async def fetch(self, url: str) -> FetchResult:
-        if not self.light_ok:
+        if self.fetch_mode == 'page_navigation' or not self.light_ok:
             return await self.load(url)
+        measurement = self._measurement()
         try:
             raw = await asyncio.wait_for(self.page.evaluate(LIGHT_JS, [self._final_url.get(url, url),
                                                                          bool(self.sample_path) and not self._sample_written]), 35)
@@ -228,15 +307,22 @@ class Scraper:
             if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
                 self._final_url[url] = raw.get('url', url)
             # A restriction is a result, never a reason to make another request here.
-            return result
+            return self._measured(result, measurement, 'light_fetch')
         except Exception as exc:
-            return self._error(url, exc)
+            return self._measured(self._error(url, exc), measurement, 'light_fetch')
 
     async def load(self, url: str) -> FetchResult:
+        measurement = self._measurement()
+        code, headers = None, {}
         try:
             response = await self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
             code = response.status if response else None
             headers = await response.all_headers() if response else {}
+            if code in (403, 429, 439):
+                # A known HTTP restriction is sufficient, even if the document cannot be inspected.
+                result = parse_result(dict(status=code, retry_after=headers.get('retry-after')),
+                                      self.source_id, _city(url))
+                return self._measured(result, measurement, 'page_navigation')
             result = await self.read_current(url, code, headers.get('retry-after'))
             if result.status is FetchStatus.PARSE_CHANGED and code not in (403, 429, 439):
                 # Wait for client rendering, without navigation or fetch retries.
@@ -245,9 +331,13 @@ class Scraper:
                 except Exception:
                     pass
                 result = await self.read_current(url, code, headers.get('retry-after'))
-            return result
+            return self._measured(result, measurement, 'page_navigation')
         except Exception as exc:
-            return self._error(url, exc)
+            if code in (403, 429, 439):
+                result = parse_result(dict(status=code, retry_after=headers.get('retry-after')),
+                                      self.source_id, _city(url))
+                return self._measured(result, measurement, 'page_navigation')
+            return self._measured(self._error(url, exc), measurement, 'page_navigation')
 
     async def read_current(self, url: str | None = None, code: int | None = None,
                            retry_after: str | None = None) -> FetchResult:

@@ -220,6 +220,27 @@ class Monitor:
     def _waiting_status(self, state: dict) -> str:
         return f"{state['state']}: {self.restriction_label(state)}"
 
+    def _stop_reason(self, now: float) -> str | None:
+        """Why the next scheduled check cannot run; None when it may."""
+        if self.paused:
+            return 'PAUSED: пауза'
+        if not self.db.subscriptions(only_enabled=True):
+            return 'нет активных запросов'
+        for state in self.db.source_states(self.source_id):
+            if self._restricting(state, now):
+                return self._waiting_status(state)
+        return None
+
+    def refresh_status(self) -> None:
+        """Show the effect of a command at once instead of waiting for the next poll."""
+        if self._source_stopped:
+            return
+        stop = self._stop_reason(time.time())
+        if stop:
+            self.status = stop
+        elif not self.status.startswith('ACTIVE'):
+            self.status = 'ACTIVE: ожидает следующей проверки'
+
     async def _poll_once(self) -> bool:
         if self._restored:
             restored, self._restored = self._restored, []
@@ -242,17 +263,11 @@ class Monitor:
             return False
         if self._source_stopped:
             return False
-        if self.paused:
-            self.status = 'PAUSED: пауза'
-            return False
-        if not self.db.subscriptions(only_enabled=True):
-            self.status = 'нет активных запросов'
-            return False
         now = time.time()
-        for state in self.db.source_states(self.source_id):
-            if self._restricting(state, now):
-                self.status = self._waiting_status(state)
-                return False
+        stop = self._stop_reason(now)
+        if stop:
+            self.status = stop
+            return False
         if float(self.db.get(f'next_poll:{self.source_id}') or 0) > now:
             return False
         cities = self.cities()
@@ -427,6 +442,7 @@ class Monitor:
         self.db.set('paused', '1' if paused else '0')
         if not paused:
             self._release_expired_rate_limits()
+        self.refresh_status()
         self._wake.set()
 
     def _release_expired_rate_limits(self) -> None:
@@ -441,18 +457,24 @@ class Monitor:
 
     async def resume(self) -> str:
         async with self._source_lock:
-            self.set_paused(False)
-            now = time.time()
-            states = [s for s in self.db.source_states(self.source_id) if self._restricting(s, now)]
-            checks = [s for s in states if s['state'] == SourceState.WAITING_FOR_USER
-                      and s['reason'] in VERIFICATION_REASONS]
-            if checks:
-                return await self._confirm_loaded_page(checks)
-            if states:
-                return ('Ручная пауза снята, но ограничение Авито ещё действует и не сбрасывается командой:\n'
-                        + '\n'.join(f"{s['city']}: {self.restriction_label(s)}. "
-                                     + self.restriction_details(s, now)[-1] for s in states))
-            return 'Опрос возобновлён.'
+            try:
+                return await self._resume()
+            finally:
+                self.refresh_status()
+
+    async def _resume(self) -> str:
+        self.set_paused(False)
+        now = time.time()
+        states = [s for s in self.db.source_states(self.source_id) if self._restricting(s, now)]
+        checks = [s for s in states if s['state'] == SourceState.WAITING_FOR_USER
+                  and s['reason'] in VERIFICATION_REASONS]
+        if checks:
+            return await self._confirm_loaded_page(checks)
+        if states:
+            return ('Ручная пауза снята, но ограничение Авито ещё действует и не сбрасывается командой:\n'
+                    + '\n'.join(f"{s['city']}: {self.restriction_label(s)}. "
+                                 + self.restriction_details(s, now)[-1] for s in states))
+        return 'Опрос возобновлён.'
 
     async def _confirm_loaded_page(self, checks: list[dict]) -> str:
         """Read the page already open in the browser; a confirmed catalog lifts the check without a request."""
@@ -493,7 +515,10 @@ class Monitor:
 
     async def open_verification(self) -> str:
         async with self._source_lock:
-            return await self._open_verification()
+            try:
+                return await self._open_verification()
+            finally:
+                self.refresh_status()
 
     async def _open_verification(self) -> str:
         self._check_browser()

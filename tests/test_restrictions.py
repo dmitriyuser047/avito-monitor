@@ -243,3 +243,26 @@ def test_manual_pause_is_separate_from_restrictions(tmp_path):
         assert await mon.poll_once()
         db.close()
     asyncio.run(scenario())
+
+
+def test_status_reflects_commands_immediately(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        db.save_source_state('local_browser', 'kazan', SourceState.WAITING_FOR_USER, time.time() - 60,
+                             'repeated HTTP 429', 429)
+        scraper = source(tmp_path, dict(catalog=True, empty=True, items=[]))
+        mon = Monitor(config(tmp_path), db, scraper, AsyncMock())
+        db.set('next_poll:local_browser', str(time.time() + 3600))  # no poll may refresh the status
+        assert not await mon.poll_once()
+        assert mon.status.startswith('WAITING_FOR_USER: старая сохранённая блокировка')
+        assert await mon.resume() == 'Опрос возобновлён.'
+        # The menu sent right after /resume must not show the lifted restriction.
+        assert mon.status == 'ACTIVE: ожидает следующей проверки'
+        scraper.page.goto.assert_not_awaited()
+        mon.set_paused(True)
+        assert mon.status == 'PAUSED: пауза'
+        db.save_source_state('local_browser', 'kazan', SourceState.COOLDOWN, time.time() + 600, 'HTTP 429', 429)
+        assert 'не сбрасывается' in await mon.resume()
+        assert mon.status == 'COOLDOWN: новый HTTP 429'
+        db.close()
+    asyncio.run(scenario())

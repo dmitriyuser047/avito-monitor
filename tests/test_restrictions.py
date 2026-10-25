@@ -413,3 +413,23 @@ def test_pause_commands_and_buttons_are_gone(command):
     labels = [b.text for row in menu[1].inline_keyboard for b in row]
     assert not any('пауз' in label.lower() or 'продолжить' in label.lower() for label in labels)
     assert command not in {c.command for c in COMMANDS}
+
+
+def test_restored_captcha_is_confirmed_after_unblock_shows_the_check(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        old = source(tmp_path, dict(challenge=True, items=[]), engine='playwright', mode='page_navigation')
+        await Monitor(config(tmp_path, 'playwright', 'page_navigation'), db, old, AsyncMock()).poll_once()
+        db.close()
+        db = database(tmp_path)
+        scraper = source(tmp_path, dict(challenge=True, items=[]), url='about:blank')
+        mon = Monitor(config(tmp_path), db, scraper, AsyncMock())
+        assert not await mon.poll_once()
+        scraper.page.url = CATALOG
+        assert 'команды отправлять не нужно' in await mon.open_verification()  # the check is on screen now
+        assert state(db)['state'] == SourceState.VERIFICATION_REQUIRED
+        respond(scraper, catalog(100))  # the user passed it
+        assert not await mon.poll_once()
+        assert state(db)['state'] == SourceState.AVAILABLE and scraper.page.goto.await_count == 1
+        db.close()
+    asyncio.run(scenario())

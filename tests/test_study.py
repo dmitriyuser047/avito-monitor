@@ -231,7 +231,10 @@ def test_legacy_waiting_for_resume_migrates_to_timed_restriction(setup):
             db.conn.execute("INSERT OR REPLACE INTO source_state(source_id,city,state,next_allowed_at,reason,updated_at)"
                             " VALUES ('local_browser','kazan','WAITING_FOR_USER',?,'repeated HTTP 429',1)",(future,))
             db.conn.execute("INSERT OR REPLACE INTO settings VALUES ('paused','1')")
+            db.conn.execute("INSERT OR REPLACE INTO source_state(source_id,city,state,reason,updated_at)"
+                            " VALUES ('local_browser','*','STOPPED','browser closed',1)")
         migrated=DB(cfg.data_dir/'x.sqlite3')
+        assert [s['city'] for s in migrated.source_states('local_browser')]==['kazan']
         state=migrated.source_states('local_browser')[0]
         # The saved term and its origin stay; the wait for /resume and the user pause do not.
         assert state['state']==SourceState.RATE_LIMITED and state['next_allowed_at']==future

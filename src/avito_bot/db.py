@@ -183,7 +183,8 @@ class DB:
         from .sources import legacy_state  # sources imports matcher, which imports this module
         for source_id, city, state, reason in list(self.conn.execute(
                 'SELECT source_id,city,state,reason FROM source_state')):
-            mapped = legacy_state(state, reason)
+            # '*' rows were a service-level marker; the service state is no longer a source state.
+            mapped = None if city == '*' else legacy_state(state, reason)
             if mapped is None:
                 self.conn.execute('DELETE FROM source_state WHERE source_id=? AND city=?', (source_id, city))
             elif mapped != state:

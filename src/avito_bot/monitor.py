@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 from .access_coordinator import AccessCoordinator
 from .config import Config, feed_url
 from .db import DB
+from .listings_collector import same_search
 from .matcher import classify, is_fresh, matches
 from .sources import (FetchResult, FetchStatus, IP_CHECK_REASON, Search, ServiceState, Source, SourceState,
                       TIMED_STATES, USER_STATES)
@@ -404,7 +405,13 @@ class Monitor:
     # ---------- results ----------
 
     async def _handle(self, result: FetchResult, url: str, operation: str = 'automatic',
-                      announce: bool = True) -> None:
+                      announce: bool = True, alerts: list | None = None) -> None:
+        async def notify(text):
+            if alerts is not None:
+                alerts.append(text)
+            else:
+                await self.alert(text)
+
         status, city = result.status, result.city
         correlation_id = uuid.uuid4().hex[:12]
         diagnostic_names = ('browser_engine', 'browser_channel', 'fetch_mode', 'actual_mode', 'run_id',
@@ -449,7 +456,7 @@ class Monitor:
                 self._event('source_recovered', correlation_id=correlation_id, city=city,
                             result=before['state'], recovery_sec=round(recovery, 1))
                 if announce:
-                    await self.alert(f'Доступ к Авито восстановлен\nГород: {city}. Сбор продолжается; '
+                    await notify(f'Доступ к Авито восстановлен\nГород: {city}. Сбор продолжается; '
                                      f'ограничение длилось {_left(recovery)}.')
             items = [i for i in result.items if i.feed in self.cfg.sections]
             for item in items:
@@ -457,7 +464,7 @@ class Monitor:
             subs = self.db.subscriptions(only_enabled=True)
             observation_key = f'observation_seed:{self.source_id}:{city}'
             baseline = self.db.get(observation_key) is None
-            with self.db.conn:
+            with self.db.atomic():
                 for item in items:
                     matched_now = is_fresh(item, result.observed_at) and any(
                         city in (s.cities or [self.cfg.city]) and matches(item, s) for s in subs)
@@ -479,7 +486,7 @@ class Monitor:
                 key = f'coverage:{self.source_id}:{city}'
                 if self.db.get(key) != 'gap':
                     self._event('coverage_gap', correlation_id=correlation_id, city=city)
-                    await self.alert(f'Возможны пропуски в выдаче\nГород: {city}. '
+                    await notify(f'Возможны пропуски в выдаче\nГород: {city}. '
                                      'У соседних снимков нет общих объявлений. Дополнительные запросы не выполняются.')
                 self.db.set(key, 'gap')
             elif ids:
@@ -517,7 +524,7 @@ class Monitor:
                          + (' и продолжит сбор сразу. ' if not server_until else ', а сбор начнётся после срока Авито. '))
             elif not server_until:
                 text += EARLY_RESUME + ' '
-            await self.alert(text + 'Очередь Telegram работает.')
+            await notify(text + 'Очередь Telegram работает.')
         elif status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
             state = SourceState.VERIFICATION_REQUIRED if status is FetchStatus.CHALLENGE else SourceState.ACCESS_DENIED
             server_until = until = time.time() + result.retry_after_sec if result.retry_after_sec else None
@@ -538,7 +545,7 @@ class Monitor:
                 where = ('Страница проверки уже открыта в окне Chrome бота.' if shown else
                          'Разверните окно Chrome бота и обновите страницу (или отправьте /unblock), '
                          'чтобы увидеть проверку.')
-                await self.alert(f'Нужна проверка Авито: {REASON_TEXT[status.value]}, {code}\n' + answered
+                await notify(f'Нужна проверка Авито: {REASON_TEXT[status.value]}, {code}\n' + answered
                                  + 'Автоматические запросы остановлены, повторов вслепую нет. ' + where
                                  + ' Пройдите её — бот сам увидит обычную выдачу и продолжит сбор, '
                                  'команды отправлять не нужно. Очередь Telegram работает.')
@@ -557,7 +564,7 @@ class Monitor:
             self.verification.note_restriction(city, saved['since'], False)  # an error page proves nothing
             self.status = f'{state}: {STATE_TEXT[state]}'
             if changed:
-                await self.alert('Источник временно недоступен\n'
+                await notify('Источник временно недоступен\n'
                                  + ('Страница Авито не распознана.' if status is FetchStatus.PARSE_CHANGED
                                     else 'Ошибка сети или сервера.')
                                  + f' Следующая попытка после {_when(until)}, сбор продолжится сам.')
@@ -666,35 +673,43 @@ class Monitor:
     # ---------- verification ----------
 
     async def confirm_verification(self, result: FetchResult, page_url: str, states: list[dict]) -> None:
-        """A normal catalog in the loaded page ends a pending check; a server term still binds."""
+        """One transaction for the proven city's state, event, metrics and durable listings."""
+        feed = feed_url(result.city, self.cfg.feed)
+        states = [s for s in states if s['city'] == result.city]
+        if not states or not same_search(page_url, feed):
+            raise ValueError('Confirmation requires the exact pending catalog search')
         result.diagnostics.update(actual_mode='loaded_dom', is_warmup=False,
                                   browser_engine=getattr(self.scraper, 'browser_engine', None),
                                   browser_channel=getattr(self.scraper, 'browser_channel', None),
                                   fetch_mode=getattr(self.scraper, 'fetch_mode', None),
                                   run_id=getattr(self.scraper, 'run_id', None))
-        now = time.time()
-        # The confirmed page is an observation: the next scheduled check keeps the normal interval.
-        self.db.set(f'next_poll:{self.source_id}', str(now + self.next_delay()))
-        terms = {s['city']: s['server_until'] for s in states if (s.get('server_until') or 0) > now}
-        self._event('verification_confirmed', city=result.city, result=result.status.value,
-                    cities=[s['city'] for s in states], server_term=bool(terms))
-        # Same feed key as automatic polling, so the confirmed page is not mistaken for a new baseline.
-        feed = feed_url(result.city, self.cfg.feed)
-        same_feed = urlparse(page_url).path.strip('/') == urlparse(feed).path.strip('/')
-        await self._handle(result, feed if same_feed else page_url, operation='verification',
-                           announce=not terms)
-        for state in states:
-            if state['city'] in terms:
-                self.db.save_source_state(self.source_id, state['city'], SourceState.RATE_LIMITED,
-                                          terms[state['city']], 'verification passed; Retry-After',
-                                          state['http_status'], terms[state['city']])
-            else:
-                self.db.save_source_state(self.source_id, state['city'], SourceState.AVAILABLE)
+        now, alerts = time.time(), []
+        terms = [s['server_until'] for s in states if (s.get('server_until') or 0) > now]
+        memory = self.status, self.last_ok, self.last_items, self.collection_confirmed, self._errors.copy()
+        try:
+            with self.db.atomic():
+                self.db.set(f'next_poll:{self.source_id}', str(now + self.next_delay()))
+                # All notifications are buffered: no external await/yield inside this transaction.
+                await self._handle(result, feed, operation='verification', announce=not terms, alerts=alerts)
+                self.access.confirm(result.city, now)
+                self.db.record_event('verification_confirmed', source_id=self.source_id,
+                                     city=result.city, result=result.status.value,
+                                     cities=[result.city], server_term=bool(terms))
+        except BaseException:
+            self.status, self.last_ok, self.last_items, self.collection_confirmed, self._errors = memory
+            raise
+        if hasattr(self.scraper, 'collector'):
+            self.scraper.collector.consumed()
         if terms:
-            await self.alert('Проверка пройдена\nОбычная выдача подтверждена по открытой странице. Авито указал срок '
-                             f'до {_when(max(terms.values()))} — сбор продолжится сам после него.')
+            alerts.append('Проверка пройдена\nОбычная выдача подтверждена по открытой странице. Авито указал срок '
+                          f'до {_when(max(terms))} — сбор продолжится сам после него.')
         self.refresh_status()
         self._wake.set()
+        for text in alerts:
+            try:
+                await self.alert(text)
+            except Exception:
+                log.exception('Cannot announce committed verification')
 
     async def open_verification(self) -> str:
         async with self._source_lock:
@@ -724,9 +739,8 @@ class Monitor:
         self.db.set(f'next_poll:{self.source_id}', str(time.time() + self.next_delay()))
         await self._handle(result, feed_url(city, self.cfg.feed), operation='manual')
         if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
-            # No server term is active (checked above); a normal catalog ends every stop.
-            for state in waiting:
-                self.db.save_source_state(self.source_id, state['city'], SourceState.AVAILABLE)
+            # This catalog proves access only for its own city.
+            self.access.confirm(city, time.time())
             self._wake.set()
             return 'Страница открыта, обычная выдача подтверждена. Сбор продолжается.'
         if result.status is FetchStatus.RATE_LIMITED:
@@ -754,7 +768,10 @@ class Monitor:
                  f'Фактический интервал: {self.last_interval_sec:.1f} с' if self.last_interval_sec else 'Фактический интервал: ещё не измерен']
         if hasattr(self.scraper, 'browser_engine'):
             lines.append(f'Браузер: {self.scraper.browser_engine}/{self.scraper.browser_channel}, '
-                         f'режим: {self.scraper.fetch_mode}'
+                         f'режим: {self.scraper.fetch_mode}; сессия: {getattr(self.scraper, "session_mode", "managed")}'
+                         + (f'; ошибка сессии: {html.escape(str(self.scraper.session_manager.session.last_error))}'
+                            if getattr(getattr(getattr(self.scraper, 'session_manager', None), 'session', None),
+                                       'last_error', None) else '')
                          + (f'; перезапуск: {html.escape(self.source_down)}' if self.source_down else ''))
         for s in states:
             if self._restricting(s, now):

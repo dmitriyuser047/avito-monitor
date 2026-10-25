@@ -18,6 +18,7 @@ from pathlib import Path
 from .browser_session import BrowserSessionManager
 from .startup_diagnostics import StartupDiagnostics
 
+from .listings_collector import ListingsCollector
 from .matcher import Item
 from .sources import FetchResult, FetchStatus
 
@@ -98,7 +99,6 @@ LIGHT_JS = f"""async ([url, wantHtml]) => {{
   const r = await fetch(url, {{credentials: 'include', cache: 'no-store',
     signal: AbortSignal.timeout(25000), headers: {{'accept': 'text/html,application/xhtml+xml'}}}});
   const meta = {{status: r.status, url: r.url, retry_after: r.headers.get('retry-after')}};
-  if ([403, 429, 439].includes(r.status)) return {{...meta, items: []}};
   const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
   const out = ({INSPECT_FN})(doc);
   // Debug output deliberately excludes scripts, form values, cookies and full HTML.
@@ -127,6 +127,8 @@ def retry_after_seconds(value: str | None, now: float | None = None) -> float | 
 def parse_result(raw: dict, source_id: str, city: str) -> FetchResult:
     code = raw.get('status')
     diagnostics = {'catalog': bool(raw.get('catalog')), 'raw_count': len(raw.get('items', []))}
+    if code == 429:
+        diagnostics['verification_page'] = bool(raw.get('challenge') or raw.get('blocked'))
     result = FetchResult(FetchStatus.PARSE_CHANGED, [], source_id, city, time.time(), code,
                          retry_after_seconds(raw.get('retry_after')), diagnostics)
     if code == 429:
@@ -216,6 +218,7 @@ class Scraper:
         # Main-frame navigations in this browser run; light_fetch never navigates, so a newer
         # number proves the open document is newer than a restriction answered by fetch().
         self.navigation_generation = 0
+        self.collector = ListingsCollector(self)
         self.last_error: str | None = None
         self._sample_written = False
         self.sample_path = profile_dir.parent / 'feed_sample.html' if save_debug_html else None
@@ -266,8 +269,9 @@ class Scraper:
         if getattr(frame, 'parent_frame', None) is None:
             self.navigation_generation += 1
 
+    @owns_page
     async def check(self, search) -> FetchResult:
-        return await self.fetch(search.url)
+        return await self.collector.check(search)
 
     async def health(self):
         from .sources import SourceHealth
@@ -447,9 +451,11 @@ class Scraper:
         url = url or (self.page.url if self.page else '')
         try:
             # Reads the document already in the page; never a network request.
-            raw = await asyncio.wait_for(self.page.evaluate(f'({INSPECT_FN})(document)'), 15)
+            raw = await asyncio.wait_for(self.page.evaluate(
+                f'() => ({{...({INSPECT_FN})(document), document_started_at: performance.timeOrigin / 1000}})'), 15)
             raw.update(status=code, retry_after=retry_after)
             result = parse_result(raw, self.source_id, _city(url))
+            result.diagnostics['document_started_at'] = raw.get('document_started_at')
             if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
                 self.light_ok = True
                 self._final_url[url] = self.page.url

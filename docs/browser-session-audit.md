@@ -1,6 +1,8 @@
 # Browser session audit — 26 October 2026
 
-Baseline and current `origin/main`: `e1577f62e71c8e3334aaa931ae5c6838361c470d` (fetched before work).
+Initially fetched `origin/main`: `e1577f62e71c8e3334aaa931ae5c6838361c470d`.
+During the audit main advanced to `02596475f7dc3bfa61a538410b9bcc9cd3dea01a`; this branch includes
+that revision, including its newer-DOM recovery of local delays and explicit `/unblock` policy.
 No production navigation or live Avito experiment was performed.
 
 ## Startup sequence at baseline

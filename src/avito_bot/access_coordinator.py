@@ -110,10 +110,11 @@ class AccessCoordinator:
         if not active_server:
             facts.rate_limit_until = None
             facts.rate_limit_is_server_defined = False
-        self._save(city, facts)
-        self.db.save_source_state(self.source_id, city,
-            SourceState.RATE_LIMITED if active_server else SourceState.AVAILABLE,
-            facts.rate_limit_until if active_server else None,
-            'verification passed; Retry-After' if active_server else '', facts.http_status,
-            facts.rate_limit_until if active_server else None)
+        with self.db.atomic():
+            self._save(city, facts)
+            self.db.save_source_state(self.source_id, city,
+                SourceState.RATE_LIMITED if active_server else SourceState.AVAILABLE,
+                facts.rate_limit_until if active_server else None,
+                'verification passed; Retry-After' if active_server else '', facts.http_status,
+                facts.rate_limit_until if active_server else None)
         return facts

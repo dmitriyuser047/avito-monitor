@@ -314,6 +314,12 @@ class Monitor:
         await self._handle(result, search.url)
         return True
 
+    async def ingest(self, result: FetchResult) -> None:
+        """Results pushed by a source (e.g. a webhook) go through the same staging and restriction policy."""
+        async with self._source_lock:
+            await self._handle(result, feed_url(result.city, self.cfg.feed), operation='push')
+            self.refresh_status()
+
     # ---------- browser lifecycle ----------
 
     async def _start_browser(self) -> None:

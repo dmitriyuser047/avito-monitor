@@ -281,6 +281,10 @@ class Monitor:
             restored, self._restored = self._restored, []
             await self.alert(self._restored_text(restored))
         try:
+            await self._daily_report()
+        except Exception:
+            log.exception('Daily report failed; source scheduling continues')
+        try:
             self.study.tick(self)
         except Exception:
             log.exception('Passive study recording failed; source scheduling continues')
@@ -441,6 +445,7 @@ class Monitor:
                          result.observed_at, int(matched_now), int(baseline)))
                 self.db.conn.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (observation_key,'1'))
             self.last_items = items
+            self._track_prices(items, subs, result.observed_at, correlation_id)
             if self.db.get(f'feed:{url}') is None:
                 # Seed existing listings; preserve the legacy baseline key.
                 self.db.mark_seen([i.id for i in items])
@@ -450,6 +455,7 @@ class Monitor:
             if ids and previous and previous[0] and overlap == 0:
                 key = f'coverage:{self.source_id}:{city}'
                 if self.db.get(key) != 'gap':
+                    self._event('coverage_gap', correlation_id=correlation_id, city=city)
                     await self.alert(f'Возможны пропуски в выдаче\nГород: {city}. '
                                      'У соседних снимков нет общих объявлений. Дополнительные запросы не выполняются.')
                 self.db.set(key, 'gap')
@@ -566,6 +572,58 @@ class Monitor:
         except OSError:
             log.warning('Cannot append diagnostic items; durable events are already stored')
         return matched_count
+
+    def _track_prices(self, items, subs, observed_at: float, correlation_id: str) -> None:
+        """Keep a price history; a matching known listing that got noticeably cheaper is notified once."""
+        threshold = self.cfg.price_drop_percent
+        recipients = None
+        for item in items:
+            if item.price is None:
+                continue
+            change = self.db.record_price(item.id, item.price, observed_at)
+            if not change or change[1] is None or not threshold:
+                continue
+            history_id, old = change
+            if item.price > old * (1 - threshold / 100):
+                continue
+            matched = [s for s in subs if item.city in (s.cities or [self.cfg.city]) and matches(item, s)]
+            if not matched:
+                continue
+            recipients = self.recipients() if recipients is None else recipients
+            drop = round(100 * (old - item.price) / old)
+            item.found_at = observed_at
+            note = f'Цена снижена: {old:,} → {item.price:,} ₽ (−{drop}%)'.replace(',', ' ')
+            payload = {'item': asdict(item), 'subs': [asdict(s) for s in matched], 'source_id': self.source_id,
+                       'correlation_id': correlation_id, 'kind': 'price_drop', 'old_price': old, 'note': note}
+            staged = self.db.stage_price_drop(history_id, payload, recipients, observed_at)
+            self._event('listing_price_dropped', correlation_id=correlation_id, result=str(item.id),
+                        old_price=old, price=item.price, recipients=staged)
+
+    async def _daily_report(self) -> None:
+        hour = self.cfg.daily_report_hour
+        now = datetime.now()
+        if hour < 0 or now.hour != hour or self.db.get('daily_report_date') == now.date().isoformat():
+            return
+        self.db.set('daily_report_date', now.date().isoformat())
+        from .metrics import availability_report
+        day = availability_report(self.db.conn, time.time() - 86400, time.time())
+        src, service, delivery = day['source'], day['service'], day['delivery']
+        share = f"{src['success_share']:.0%}" if src['success_share'] is not None else 'нет проверок'
+        gaps = self.db.conn.execute("SELECT COUNT(*) FROM events WHERE kind='coverage_gap' AND at>=?",
+                                    (time.time() - 86400,)).fetchone()[0]
+        states = [s for s in self.db.source_states(self.source_id) if self._restricting(s, time.time())]
+        lines = ['Ежедневный отчёт за 24 часа',
+                 f"Сервис работал: {service['share']:.0%} времени, запусков: {service['starts']}",
+                 f"Источник: проверок {src['checks']}, успешных {share}; HTTP 429: {src['http_429']}, "
+                 f"HTTP 403: {src['http_403']}, проверок в браузере: {src['verification_required']}",
+                 f"Новых объявлений обнаружено: {day['listings']['unique_discovered']}, "
+                 f"уведомлений доставлено: {delivery['confirmed']}, очередь: {delivery['queue'] or 'пусто'}",
+                 f'Возможные пропуски выдачи: {gaps}',
+                 'Сейчас: ' + (', '.join(f"{s['city']} — {self.restriction_label(s)}" for s in states)
+                               or 'источник доступен'),
+                 'Доставка в Telegram не доказывает работу сбора: смотрите строку «Источник».']
+        self._event('daily_report', result=share)
+        await self.alert('\n'.join(lines))
 
     # ---------- verification ----------
 

@@ -147,6 +147,13 @@ class DB:
                 details_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_events_kind_at ON events(kind, at);
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY,
+                item_id INTEGER NOT NULL,
+                price INTEGER NOT NULL,
+                seen_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_price_item ON price_history(item_id, id);
             CREATE TABLE IF NOT EXISTS study_samples (
                 study_id INTEGER NOT NULL,
                 sampled_at REAL NOT NULL,
@@ -257,11 +264,12 @@ class DB:
     def found_today(self) -> int:
         midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         return self.conn.execute(
-            "SELECT COUNT(DISTINCT item_id) FROM notifications WHERE sent_at >= ?", (midnight,)
+            "SELECT COUNT(DISTINCT item_id) FROM notifications WHERE sent_at >= ? AND item_id > 0", (midnight,)
         ).fetchone()[0]
 
     def found_for(self, sub_id: int) -> int:
-        return self.conn.execute("SELECT COUNT(DISTINCT item_id) FROM notifications WHERE sub_id = ?", (sub_id,)).fetchone()[0]
+        return self.conn.execute("SELECT COUNT(DISTINCT item_id) FROM notifications WHERE sub_id = ? AND item_id > 0",
+                                 (sub_id,)).fetchone()[0]
 
     # Событие и задания каждому получателю фиксируются одной транзакцией.
     def stage_items(self, entries: list[tuple[int, dict, list[int]]], now: float) -> list[int]:
@@ -280,6 +288,51 @@ class DB:
                         (item_id, chat_id, encoded, now))
                 inserted.append(item_id)
         return inserted
+
+    # --- история цен ---
+
+    def record_price(self, item_id: int, price: int, at: float) -> tuple[int, int | None] | None:
+        """Store a price only when it changes: (history id, previous price) or None when unchanged."""
+        last = self.conn.execute('SELECT price FROM price_history WHERE item_id=? ORDER BY id DESC LIMIT 1',
+                                 (item_id,)).fetchone()
+        if last and last[0] == price:
+            return None
+        with self.conn:
+            cur = self.conn.execute('INSERT INTO price_history(item_id,price,seen_at) VALUES (?,?,?)',
+                                    (item_id, price, at))
+        return cur.lastrowid, last[0] if last else None
+
+    def price_history(self, item_id: int, limit: int = 10) -> list[tuple[int, float]]:
+        return list(self.conn.execute('SELECT price,seen_at FROM price_history WHERE item_id=? ORDER BY id DESC LIMIT ?',
+                                      (item_id, limit)))
+
+    def stage_price_drop(self, history_id: int, payload: dict, chat_ids: list[int], now: float) -> int:
+        """One durable job per recipient and price change; the negative id never collides with a listing."""
+        encoded = json.dumps(payload, ensure_ascii=False)
+        with self.conn:
+            return sum(self.conn.execute(
+                'INSERT OR IGNORE INTO notification_outbox (item_id, chat_id, payload_json, next_attempt_at)'
+                ' VALUES (?, ?, ?, ?)', (-history_id, chat_id, encoded, now)).rowcount for chat_id in set(chat_ids))
+
+    def recent_items(self, limit: int = 10) -> list[tuple[int, dict, float]]:
+        """Latest listings that matched a subscription (unmatched observations are skipped)."""
+        found = []
+        for item_id, payload, seen in self.conn.execute(
+                'SELECT item_id,payload_json,first_seen_at FROM items ORDER BY first_seen_at DESC LIMIT ?',
+                (limit * 20,)):
+            data = json.loads(payload)
+            if data.get('subs'):
+                found.append((item_id, data, seen))
+                if len(found) == limit:
+                    break
+        return found
+
+    def recent_events(self, kinds: tuple[str, ...], limit: int = 15) -> list[dict]:
+        marks = ','.join('?' * len(kinds))
+        cur = self.conn.execute(f'SELECT at,kind,city,result,details_json FROM events WHERE kind IN ({marks})'
+                                ' ORDER BY id DESC LIMIT ?', (*kinds, limit))
+        return [dict(at=at, kind=kind, city=city, result=result, details=json.loads(details))
+                for at, kind, city, result, details in cur]
 
     def claim_delivery(self, now: float, lease_seconds: float = 120) -> dict | None:
         with self.conn:

@@ -53,7 +53,10 @@ class DeliveryWorker:
                                  job_id=job['id'], attempt=job['attempts'])
             item = Item(**payload['item'])
             subs = [Subscription(**s) for s in payload['subs']]
-            await self.send(item, subs, job['chat_id'])
+            if payload.get('note'):
+                await self.send(item, subs, job['chat_id'], note=payload['note'])
+            else:
+                await self.send(item, subs, job['chat_id'])
         except asyncio.CancelledError:
             self.db.fail_delivery(job['id'], 'Interrupted before acknowledgement', time.time())
             raise

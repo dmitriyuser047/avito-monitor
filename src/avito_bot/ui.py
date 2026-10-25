@@ -443,7 +443,7 @@ def wiz_confirm(query: str, pmin: int | None, pmax: int | None, minus: list[str]
 
 # --- уведомление об объявлении ---
 
-def item_caption(item: Item, subs: list[Subscription]) -> str:
+def item_caption(item: Item, subs: list[Subscription], note: str | None = None) -> str:
     def escaped(text: str, budget: int) -> str:
         parts, size = [], 0
         for char in text:
@@ -459,7 +459,8 @@ def item_caption(item: Item, subs: list[Subscription]) -> str:
     queries = escaped(', '.join(sub_title(s.query, s.category) for s in subs), 180)
     desc = escaped(item.description[:220], 260).strip()
     return (
-        f"<b>{escaped(item.title, 240)}</b>\n"
+        (f"<b>{escaped(note, 80)}</b>\n" if note else "")
+        + f"<b>{escaped(item.title, 240)}</b>\n"
         f"<b>{price}</b>\n"
         + (f"{meta}\n" if meta else "")
         + f"{when_text(item)}\n"
@@ -488,3 +489,65 @@ def alert_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(_btn("Состояние", Nav(to="status")))
     return kb.as_markup()
+
+
+# --- история и диагностика ---
+
+ERROR_EVENTS = ('source_rate_limited', 'verification_required', 'verification_confirmed',
+                'source_recovered', 'source_failed', 'coverage_gap')
+EVENT_TEXT = {
+    'source_rate_limited': 'HTTP 429',
+    'verification_required': 'нужна проверка',
+    'verification_confirmed': 'проверка пройдена',
+    'source_recovered': 'восстановлено',
+    'source_failed': 'сбой компонента',
+    'coverage_gap': 'возможный пропуск выдачи',
+}
+
+
+def recent_text(rows: list[tuple[int, dict, float, list[tuple[int, float]]]]) -> str:
+    if not rows:
+        return "<b>Последние находки</b>\n\nПодходящих объявлений пока не было."
+    lines = ["<b>Последние находки</b>"]
+    for _, data, seen, prices in rows:
+        item = data["item"]
+        price = f"{money(prices[0][0])} ₽" if prices else (
+            f"{money(item['price'])} ₽" if item.get("price") is not None else "цена не указана")
+        if len(prices) > 1:
+            price += " (было " + " → ".join(f"{money(p)}" for p, _ in reversed(prices[1:])) + ")"
+        stamp = time.strftime("%d.%m %H:%M", time.localtime(seen))
+        lines.append(f'\n<a href="{html.escape(item["url"], quote=True)}">{html.escape(item["title"][:80])}</a>\n'
+                     f"{price} · {stamp}")
+    return "\n".join(lines)
+
+
+def errors_text(events: list[dict]) -> str:
+    if not events:
+        return "<b>История ограничений</b>\n\nОграничений и сбоев не было."
+    lines = ["<b>История ограничений</b>"]
+    for e in events:
+        stamp = time.strftime("%d.%m %H:%M", time.localtime(e["at"]))
+        detail = e["details"]
+        extra = []
+        if detail.get("http_status"):
+            extra.append(f"HTTP {detail['http_status']}")
+        if detail.get("recovery_sec"):
+            extra.append(f"длилось {round(detail['recovery_sec'] / 60)} мин")
+        if detail.get("error"):
+            extra.append(str(detail["error"]))
+        if e["result"] and e["kind"] == "source_failed":
+            extra.append(e["result"])
+        where = f" · {e['city']}" if e["city"] else ""
+        lines.append(html.escape(f"{stamp} — {EVENT_TEXT.get(e['kind'], e['kind'])}{where}"
+                                 + (f" ({', '.join(extra)})" if extra else "")))
+    return "\n".join(lines)
+
+
+def link_note(link: dict, feed: str, preview: int, feed_loaded: bool) -> str:
+    note = "\n\nИз ссылки взяты текст поиска, цена и город; другие фильтры Авито не переносятся."
+    if link.get("section") and not link["section"].startswith(feed):
+        note += (f" Ссылка из раздела «{html.escape(link['section'])}», а бот следит за лентой «{html.escape(feed)}»:"
+                 " фильтры применятся к ней, отдельных запросов по ссылке не будет.")
+    if feed_loaded:
+        note += f"\nВ последней загруженной ленте подходит объявлений: {preview}."
+    return note

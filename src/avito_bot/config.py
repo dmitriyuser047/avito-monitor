@@ -65,6 +65,8 @@ class Config:
     max_backoff_seconds: float = 6 * 3600  # ceiling of the doubling local backoff
     verification_check_seconds: float = 5  # local DOM reads while a check is pending; no requests
     watchdog_seconds: float = 600  # a loop without a heartbeat this long restarts the process
+    price_drop_percent: float = 10  # notify about a matching listing that got this much cheaper; 0 disables
+    daily_report_hour: int = 9  # local hour of the daily report; -1 disables
     browser_engine: str = 'playwright'
     fetch_mode: str = 'light_fetch'
     browser_channel: str = 'chrome'
@@ -96,6 +98,8 @@ def load_config() -> Config:
         max_backoff_seconds=float(os.environ.get("MAX_BACKOFF_SECONDS", str(6 * 3600))),
         verification_check_seconds=float(os.environ.get("VERIFICATION_CHECK_SECONDS", "5")),
         watchdog_seconds=float(os.environ.get("WATCHDOG_SECONDS", "600")),
+        price_drop_percent=float(os.environ.get("PRICE_DROP_PERCENT", "10")),
+        daily_report_hour=int(os.environ.get("DAILY_REPORT_HOUR", "9")),
         browser_engine=os.environ.get('BROWSER_ENGINE', 'playwright').strip().lower(),
         fetch_mode=os.environ.get('FETCH_MODE', 'light_fetch').strip().lower(),
         browser_channel=os.environ.get('BROWSER_CHANNEL', 'chrome').strip().lower(),
@@ -110,6 +114,10 @@ def load_config() -> Config:
         value = getattr(cfg, name)
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f'{name} must be a positive finite number')
+    if not math.isfinite(cfg.price_drop_percent) or not 0 <= cfg.price_drop_percent < 100:
+        raise ValueError('PRICE_DROP_PERCENT must be 0–99')
+    if not -1 <= cfg.daily_report_hour <= 23:
+        raise ValueError('DAILY_REPORT_HOUR must be -1 (off) or 0–23')
     if cfg.max_backoff_seconds < cfg.cooldown_seconds:
         raise ValueError('MAX_BACKOFF_SECONDS must not be less than COOLDOWN_SECONDS')
     if any(h < 0 or h > 23 for h in cfg.night_hours):

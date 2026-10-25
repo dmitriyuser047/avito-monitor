@@ -24,7 +24,8 @@ from aiogram.types import (
 from . import ui
 from .config import CITY_NAMES, city_slug
 from .db import DB, Subscription
-from .matcher import Item, parse_add
+from .matcher import Item, matches, parse_add
+from .search_link import parse_avito_link
 from .ui import ItemCb, MemberCb, Nav, SubCb, Wiz
 
 log = logging.getLogger(__name__)
@@ -36,6 +37,8 @@ COMMANDS = [
     BotCommand(command="status", description="Состояние бота"),
     BotCommand(command="test", description="Проверить уведомление"),
     BotCommand(command="health", description="Источник и очередь доставки"),
+    BotCommand(command="recent", description="Последние найденные объявления"),
+    BotCommand(command="errors", description="История ограничений и сбоев"),
     BotCommand(command="unblock", description="Открыть проверку Авито вручную"),
 ]
 DESCRIPTION = (
@@ -261,6 +264,16 @@ class TelegramBot:
         async def cmd_health(m: Message):
             await m.answer(self.monitor.health_text())
 
+        @r.message(Command("recent"))
+        async def cmd_recent(m: Message):
+            await m.answer(ui.recent_text([(item_id, data, seen, self.db.price_history(item_id, 3))
+                                           for item_id, data, seen in self.db.recent_items(10)]),
+                           link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+        @r.message(Command("errors"))
+        async def cmd_errors(m: Message):
+            await m.answer(ui.errors_text(self.db.recent_events(ui.ERROR_EVENTS, 15)))
+
         @r.message(Command("unblock"), is_owner)
         async def cmd_unblock(m: Message):
             try:
@@ -284,6 +297,23 @@ class TelegramBot:
         @r.message(Command("add"))
         async def cmd_add(m: Message, command: CommandObject, state: FSMContext):
             await state.clear()
+            if command.args and command.args.strip().lower().startswith(("http://", "https://")):
+                link, problem = parse_avito_link(command.args)
+                if problem:
+                    await m.answer(problem)
+                    return
+                sub = Subscription(0, link["query"], link["pmin"], link["pmax"], [], cities=[link["city"]])
+                # Preview from the last loaded feed: the link itself is never opened.
+                preview = sum(matches(item, sub) for item in self.monitor.last_items
+                              if item.city == link["city"])
+                await state.set_state(Wizard.confirm)
+                await state.update_data(query=link["query"], category="", pmin=link["pmin"], pmax=link["pmax"],
+                                        minus=[], cities=[link["city"]])
+                text, kb = ui.wiz_confirm(link["query"], link["pmin"], link["pmax"], [], [link["city"]])
+                msg = await self._show(m, (text + ui.link_note(link, self.monitor.cfg.feed, preview,
+                                                               bool(self.monitor.last_items)), kb))
+                await state.update_data(msg_id=msg.message_id)
+                return
             if command.args:
                 # быстрый ввод одной строкой: /add 1660 super | 8000-15000 | -ti
                 query, pmin, pmax, minus = parse_add(command.args)
@@ -588,9 +618,9 @@ class TelegramBot:
         for chat_id in (self.recipients() if chat_ids is None else chat_ids):
             await self.send_to_chat(item, subs, chat_id)
 
-    async def send_to_chat(self, item: Item, subs: list[Subscription], chat_id: int) -> None:
+    async def send_to_chat(self, item: Item, subs: list[Subscription], chat_id: int, note: str | None = None) -> None:
         """Success means Telegram accepted the photo or text; errors reach the outbox worker."""
-        caption = ui.item_caption(item, subs)
+        caption = ui.item_caption(item, subs, note)
         kb = ui.item_keyboard(item, subs)
         photo = None
         try:

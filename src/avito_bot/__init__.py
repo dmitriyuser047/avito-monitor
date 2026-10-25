@@ -82,7 +82,8 @@ async def run() -> None:
                 pass
         stopper = asyncio.create_task(stop.wait(), name='shutdown')
         tasks.append(stopper)
-        log.info('Application ready: telegram=%s delivery=%s source=%s', bool(tg), bool(tg), monitor.status)
+        log.info('Application ready: telegram=%s delivery=%s source=%s pid=%s',
+                 bool(tg), bool(tg), monitor.status, os.getpid())
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:

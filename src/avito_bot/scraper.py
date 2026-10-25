@@ -61,18 +61,35 @@ TIMES_FN = """(root) => {
 INSPECT_FN = f"""(root) => {{
   const items = ({EXTRACT_FN})(root), times = ({TIMES_FN})(root);
   for (const i of items) i.ts = times[i.id] || null;
+  const catalog = root.querySelector('[data-marker="catalog-serp"]');
+  // Listing text and inactive scripts cannot identify a service/challenge page.
   const body = root.body?.cloneNode(true);
-  body?.querySelectorAll('script,style').forEach(e => e.remove());
+  body?.querySelectorAll('script,style,template,noscript,[data-marker="catalog-serp"]').forEach(e => e.remove());
   const text = (body?.textContent || '').replace(/\\s+/g, ' ').slice(0, 10000);
-  return {{title: root.title || '', items,
-    catalog: !!root.querySelector('[data-marker="catalog-serp"]'),
-    empty: !!root.querySelector('[data-marker="search-results/empty"], [data-marker="catalog-serp/empty"]')
-      || /ничего не найдено|объявлений не найдено/i.test(text),
-    blocked: /доступ ограничен|проблема с ip|доступ временно ограничен/i.test(root.title + ' ' + text),
-    challenge: /проверка безопасности|подтвердите, что вы не робот|captcha|капч[ау]/i.test(root.title)
-      || /подтвердите, что вы не робот|пройдите проверку безопасности/i.test(text)
-      || !!root.querySelector('iframe[src*="hcaptcha"], iframe[src*="geetest"], [data-marker="captcha"]')
-  }};
+  const title = (root.title || '').replace(/\\s+/g, ' ').trim();
+  const outsideCatalog = selector => [...root.querySelectorAll(selector)]
+    .some(e => !e.closest('[data-marker="catalog-serp"]'));
+  const captcha = outsideCatalog('[data-marker="captcha"], [data-marker="captcha-container"], #captcha-container')
+    || [...root.querySelectorAll('iframe[src]')].some(e => {{
+      if (e.closest('[data-marker="catalog-serp"]')) return false;
+      try {{
+        const host = new URL(e.getAttribute('src'), 'https://www.avito.ru/').hostname;
+        return /(^|\\.)(hcaptcha\\.com|geetest\\.com)$/.test(host);
+      }} catch (_) {{ return false; }}
+    }});
+  const challengeTitle = /проверка безопасности|проверка браузера|подтвердите, что вы не робот|captcha|капча/i.test(title);
+  const challengeText = /подтвердите, что вы не робот|пройдите проверку безопасности|проверяем ваш браузер/i.test(text);
+  const blockedTitle = /доступ (?:временно )?ограничен|доступ закрыт/i.test(title);
+  const blockedText = /доступ (?:к сайту )?(?:временно )?ограничен|проблема с ip|доступ с вашего ip[^.]*ограничен/i.test(text);
+  const challenge = captcha || (!catalog && (challengeTitle || challengeText));
+  const blocked = !catalog && (blockedTitle || blockedText);
+  const reason = challenge ? (captcha ? 'captcha_marker' : challengeTitle ? 'challenge_title' : 'challenge_text')
+    : blocked ? (blockedTitle ? 'blocked_title' : 'blocked_text') : null;
+  const emptyMarker = outsideCatalog('[data-marker="search-results/empty"]')
+    || !!catalog?.querySelector('[data-marker="catalog-serp/empty"], [data-marker="search-results/empty"]');
+  const emptyText = !!catalog && !items.length && /ничего не найдено|объявлений не найдено/i.test(catalog.textContent || '');
+  return {{title, items, catalog: !!catalog, empty: emptyMarker || emptyText,
+    blocked, challenge, restriction_reason: reason}};
 }}"""
 
 LIGHT_JS = f"""async ([url, wantHtml]) => {{
@@ -112,12 +129,19 @@ def parse_result(raw: dict, source_id: str, city: str) -> FetchResult:
                          retry_after_seconds(raw.get('retry_after')), diagnostics)
     if code == 429:
         result.status = FetchStatus.RATE_LIMITED
+        diagnostics['restriction_reason'] = 'http_429'
     elif code == 403:
         result.status = FetchStatus.BLOCKED
+        diagnostics['restriction_reason'] = 'http_403'
     elif code == 439 or raw.get('challenge'):
         result.status = FetchStatus.CHALLENGE
+        reason = raw.get('restriction_reason')
+        diagnostics['restriction_reason'] = ('http_439' if code == 439 else reason
+            if reason in ('captcha_marker', 'challenge_title', 'challenge_text') else 'challenge_page')
     elif raw.get('blocked'):
         result.status = FetchStatus.BLOCKED
+        reason = raw.get('restriction_reason')
+        diagnostics['restriction_reason'] = reason if reason in ('blocked_title', 'blocked_text') else 'blocked_page'
     elif code and code >= 400:
         result.status = FetchStatus.NETWORK_ERROR
     elif not raw.get('catalog'):
@@ -157,12 +181,14 @@ class Scraper:
         self._browser_lock = None
         self._network = None
         self._request_count = self._transferred_bytes = 0
+        self._bytes_available = True
         self.run_id = uuid.uuid4().hex
         self._pw = None
         self.ctx = None
         self.page = None
         self._final_url: dict[str, str] = {}
         self.light_ok = False
+        self._initial_load = True
         self._closed = False
         self._sample_written = False
         self.sample_path = profile_dir.parent / 'feed_sample.html' if save_debug_html else None
@@ -202,6 +228,7 @@ class Scraper:
             self.user_data_dir.chmod(0o700)
             self._closed = False
             self.light_ok = False
+            self._initial_load = True
             self._final_url.clear()
             self.run_id = uuid.uuid4().hex
             self._pw = await api.async_playwright().start()
@@ -226,10 +253,12 @@ class Scraper:
     async def _start_network_metrics(self) -> None:
         session = None
         self._request_count = self._transferred_bytes = 0
+        self._bytes_available = True
         try:
             session = await self.ctx.new_cdp_session(self.page)
             session.on('Network.requestWillBeSent', self._count_request)
             session.on('Network.loadingFinished', self._count_bytes)
+            session.on('disconnected', lambda *_: setattr(self, '_network', None))
             await session.send('Network.enable')
             self._network = session
         except Exception:
@@ -244,7 +273,11 @@ class Scraper:
         self._request_count += 1
 
     def _count_bytes(self, event) -> None:
-        self._transferred_bytes += max(0, int(event.get('encodedDataLength', 0)))
+        length = event.get('encodedDataLength')
+        if not isinstance(length, (int, float)) or not math.isfinite(length) or length < 0:
+            self._bytes_available = False
+            return
+        self._transferred_bytes += int(length)
 
     async def stop(self) -> None:
         try:
@@ -264,14 +297,14 @@ class Scraper:
     def _measurement(self):
         return time.monotonic(), self._request_count, self._transferred_bytes
 
-    def _measured(self, result: FetchResult, measurement, actual_mode: str) -> FetchResult:
+    def _measured(self, result: FetchResult, measurement, actual_mode: str, is_warmup: bool = False) -> FetchResult:
         started, requests, transferred = measurement
         result.diagnostics.update(
             browser_engine=self.browser_engine, fetch_mode=self.fetch_mode,
             browser_channel=self.browser_channel, actual_mode=actual_mode, run_id=self.run_id,
-            duration_sec=time.monotonic() - started,
+            duration_sec=time.monotonic() - started, is_warmup=is_warmup,
             request_count=self._request_count - requests if self._network else None,
-            transferred_bytes=self._transferred_bytes - transferred if self._network else None,
+            transferred_bytes=self._transferred_bytes - transferred if self._network and self._bytes_available else None,
             access_limited=result.status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE, FetchStatus.RATE_LIMITED))
         return result
 
@@ -299,11 +332,14 @@ class Scraper:
         try:
             raw = await asyncio.wait_for(self.page.evaluate(LIGHT_JS, [self._final_url.get(url, url),
                                                                          bool(self.sample_path) and not self._sample_written]), 35)
-            if raw.get('html') and self.sample_path:
-                self.sample_path.write_text(raw['html'], encoding='utf-8')
-                self.sample_path.chmod(0o600)
-                self._sample_written = True
             result = parse_result(raw, self.source_id, _city(url))
+            if raw.get('html') and self.sample_path:
+                try:
+                    self.sample_path.write_text(raw['html'], encoding='utf-8')
+                    self.sample_path.chmod(0o600)
+                    self._sample_written = True
+                except OSError:
+                    log.warning('Cannot write diagnostic sample; source classification is preserved')
             if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
                 self._final_url[url] = raw.get('url', url)
             # A restriction is a result, never a reason to make another request here.
@@ -314,6 +350,8 @@ class Scraper:
     async def load(self, url: str) -> FetchResult:
         measurement = self._measurement()
         code, headers = None, {}
+        is_warmup = self._initial_load
+        self._initial_load = False  # A failed first load is still measured, never retried as warm-up.
         try:
             response = await self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
             code = response.status if response else None
@@ -322,7 +360,7 @@ class Scraper:
                 # A known HTTP restriction is sufficient, even if the document cannot be inspected.
                 result = parse_result(dict(status=code, retry_after=headers.get('retry-after')),
                                       self.source_id, _city(url))
-                return self._measured(result, measurement, 'page_navigation')
+                return self._measured(result, measurement, 'page_navigation', is_warmup)
             result = await self.read_current(url, code, headers.get('retry-after'))
             if result.status is FetchStatus.PARSE_CHANGED and code not in (403, 429, 439):
                 # Wait for client rendering, without navigation or fetch retries.
@@ -331,13 +369,13 @@ class Scraper:
                 except Exception:
                     pass
                 result = await self.read_current(url, code, headers.get('retry-after'))
-            return self._measured(result, measurement, 'page_navigation')
+            return self._measured(result, measurement, 'page_navigation', is_warmup)
         except Exception as exc:
             if code in (403, 429, 439):
                 result = parse_result(dict(status=code, retry_after=headers.get('retry-after')),
                                       self.source_id, _city(url))
-                return self._measured(result, measurement, 'page_navigation')
-            return self._measured(self._error(url, exc), measurement, 'page_navigation')
+                return self._measured(result, measurement, 'page_navigation', is_warmup)
+            return self._measured(self._error(url, exc, code), measurement, 'page_navigation', is_warmup)
 
     async def read_current(self, url: str | None = None, code: int | None = None,
                            retry_after: str | None = None) -> FetchResult:
@@ -351,11 +389,12 @@ class Scraper:
                 self._final_url[url] = self.page.url
             return result
         except Exception as exc:
-            return self._error(url, exc)
+            return self._error(url, exc, code)
 
-    def _error(self, url: str, exc: Exception) -> FetchResult:
+    def _error(self, url: str, exc: Exception, code: int | None = None) -> FetchResult:
         log.warning('Source request failed: %s', type(exc).__name__)
         return FetchResult(FetchStatus.NETWORK_ERROR, [], self.source_id, _city(url), time.time(),
+                           http_status=code,
                            diagnostics={'error': type(exc).__name__})
 
     async def download(self, url: str) -> bytes | None:

@@ -15,6 +15,7 @@ FETCH_DIAGNOSTIC_COLUMNS = {
     'request_count': 'INTEGER', 'transferred_bytes': 'INTEGER',
     'access_limited': 'INTEGER', 'budget_rpm': 'REAL', 'comparison_context': 'TEXT',
     'operation': "TEXT NOT NULL DEFAULT 'automatic'",
+    'is_warmup': 'INTEGER', 'restriction_reason': 'TEXT',
 }
 
 

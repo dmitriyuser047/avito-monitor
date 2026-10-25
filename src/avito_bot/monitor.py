@@ -168,7 +168,8 @@ class Monitor:
     async def _handle(self, result: FetchResult, url: str, operation: str = 'automatic') -> None:
         status, city = result.status, result.city
         diagnostic_names = ('browser_engine', 'browser_channel', 'fetch_mode', 'actual_mode', 'run_id',
-                            'duration_sec', 'request_count', 'transferred_bytes', 'access_limited')
+                            'duration_sec', 'request_count', 'transferred_bytes', 'access_limited',
+                            'is_warmup', 'restriction_reason')
         diagnostics = {name: result.diagnostics.get(name) for name in diagnostic_names}
         context = dict(feed=self.cfg.feed, sections=self.cfg.sections,
                        subscriptions=[asdict(s) for s in self.db.subscriptions(only_enabled=True)],
@@ -179,7 +180,7 @@ class Monitor:
         # A hash lets reports detect different filters/budgets without exporting query text.
         context_id = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:16]
         collection = {name: diagnostics[name] for name in
-                      ('browser_engine', 'browser_channel', 'fetch_mode', 'actual_mode', 'run_id')}
+                      ('browser_engine', 'browser_channel', 'fetch_mode', 'actual_mode', 'run_id', 'is_warmup')}
         collection.update(comparison_context=context_id, operation=operation)
         until = None
         matched = 0

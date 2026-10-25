@@ -144,7 +144,10 @@ def test_restrictions_do_not_trigger_extra_navigation(tmp_path, mode, code, chal
         assert result.diagnostics['request_count'] is None
         assert scraper.page.goto.await_count == int(mode == 'page_navigation')
         scraper.page.wait_for_selector.assert_not_awaited()
-        assert scraper.page.evaluate.await_count == int(mode == 'light_fetch' or code == 200)
+        # A navigated 429 page is read once locally to see whether it is Avito's passable check.
+        assert scraper.page.evaluate.await_count == int(mode == 'light_fetch' or code in (200, 429))
+        if mode == 'light_fetch':
+            assert scraper.light_ok is False  # the next allowed check navigates and shows the page
     asyncio.run(scenario())
 
 
@@ -406,6 +409,8 @@ def test_service_page_fixtures_in_both_actual_modes_offline(tmp_path, engine):
         ('changed', 200, FetchStatus.PARSE_CHANGED, None),
         ('catalog', 403, FetchStatus.BLOCKED, 'http_403'),
         ('challenge', 429, FetchStatus.RATE_LIMITED, 'http_429'),
+        ('blocked-ip', 429, FetchStatus.RATE_LIMITED, 'http_429'),
+        ('changed', 429, FetchStatus.RATE_LIMITED, 'http_429'),
         ('blocked', 439, FetchStatus.CHALLENGE, 'http_439'),
         ('changed', 503, FetchStatus.NETWORK_ERROR, None),
     ]
@@ -429,6 +434,7 @@ def test_service_page_fixtures_in_both_actual_modes_offline(tmp_path, engine):
                 scraper.fetch_mode = mode
                 scraper.light_ok = True
                 for name, code, status, reason in cases:
+                    scraper.light_ok = True  # each case is measured in its configured mode
                     selected.update(name=name,code=code)
                     before = len(requests)
                     result = await scraper.fetch(URL)
@@ -441,6 +447,9 @@ def test_service_page_fixtures_in_both_actual_modes_offline(tmp_path, engine):
                         assert result.diagnostics['access_limited']
                     if code == 429:
                         assert result.retry_after_sec == 120
+                        if mode == 'page_navigation':
+                            # Only Avito's check/IP page is offered to the user; an unknown 429 page is not.
+                            assert result.diagnostics['verification_page'] is (name in ('challenge', 'blocked-ip'))
         finally:
             await scraper.stop()
     asyncio.run(scenario())

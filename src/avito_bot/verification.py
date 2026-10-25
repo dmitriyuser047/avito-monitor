@@ -9,7 +9,7 @@ import logging
 import time
 from urllib.parse import urlparse
 
-from .sources import FetchStatus, USER_STATES
+from .sources import FetchStatus, IP_CHECK_REASON, SourceState, USER_STATES
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +35,9 @@ class VerificationCoordinator:
 
     def pending(self) -> list[dict]:
         return [s for s in self.monitor.db.source_states(self.monitor.source_id)
-                if s['state'] in USER_STATES and (s['city'], s['since']) not in self._confirmed]
+                if (s['state'] in USER_STATES
+                    or (s['state'] == SourceState.RATE_LIMITED and s['reason'] == IP_CHECK_REASON))
+                and (s['city'], s['since']) not in self._confirmed]
 
     def describe(self) -> str:
         if not self.pending():

@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import time
 import uuid
 from dataclasses import asdict
@@ -17,7 +18,7 @@ from urllib.parse import urlparse
 from .config import Config, feed_url
 from .db import DB
 from .matcher import classify, is_fresh, matches
-from .sources import (FetchResult, FetchStatus, Search, ServiceState, Source, SourceState,
+from .sources import (FetchResult, FetchStatus, IP_CHECK_REASON, Search, ServiceState, Source, SourceState,
                       TIMED_STATES, USER_STATES)
 from .study import StudyRecorder
 from .verification import VerificationCoordinator
@@ -29,6 +30,7 @@ REASON_TEXT = {
     'challenge': 'капча или проверка браузера',
     'HTTP 429': 'HTTP 429: превышена частота запросов',
     'repeated HTTP 429': 'повторный HTTP 429',
+    IP_CHECK_REASON: 'HTTP 429: «Доступ ограничен: проблема с IP», Авито предлагает пройти проверку',
     'parse_changed': 'страница не распознана',
     'network_error': 'ошибка сети или сервера',
     'verification passed; Retry-After': 'проверка пройдена, действует срок Авито',
@@ -138,8 +140,12 @@ class Monitor:
 
     def restriction_label(self, state: dict) -> str:
         text = STATE_TEXT.get(state['state'], state['state'])
+        if state['reason'] == IP_CHECK_REASON:
+            text = 'HTTP 429 · можно пройти проверку в браузере'
         if state['since'] < self.started_at:
             return f'{text} · сохранено с прошлого запуска'
+        if state['state'] == SourceState.RATE_LIMITED and state['reason'] == IP_CHECK_REASON:
+            return f'новый {text}'
         if state['state'] == SourceState.RATE_LIMITED and 'HTTP 429' in state['reason']:
             return 'новый HTTP 429'
         return text
@@ -155,6 +161,9 @@ class Monitor:
         elif until and until > now:
             kind = 'срок Авито (Retry-After)' if server and server >= until - 1 else 'локальная пауза бота'
             wait = f'{kind} до {_when(until)}, осталось {_left(until - now)}; затем автоматическая проверка'
+            if state['reason'] == IP_CHECK_REASON and not (server and server > now):
+                wait += ('. Быстрее: нажмите «Продолжить» в окне Chrome бота и пройдите проверку — '
+                         'сбор продолжится сразу')
         else:
             wait = 'срок истёк, ближайшая проверка по расписанию'
         return [f"Причина: {REASON_TEXT.get(state['reason'], state['reason'] or '—')}",
@@ -180,6 +189,11 @@ class Monitor:
 
     def delay(self) -> float:
         return 60 / max(self.budget(), .01)
+
+    def next_delay(self) -> float:
+        """Interval to the next check with random spread, so polling has no fixed machine rhythm."""
+        spread = self.cfg.poll_jitter
+        return self.delay() * random.uniform(1 - spread, 1 + spread)
 
     def city_period(self) -> float:
         return len(self.cities()) * (self.delay() + (self.last_cycle_sec or 0))
@@ -309,12 +323,13 @@ class Monitor:
             self.last_interval_sec = now - self._last_started
         self._last_started = now
         # Persist budget before I/O, so a crash/restart cannot immediately poll again.
-        self.db.set(f'next_poll:{self.source_id}', str(now + self.delay()))
+        interval = self.next_delay()
+        self.db.set(f'next_poll:{self.source_id}', str(now + interval))
         self.status = f'{SourceState.CHECKING}: {city}'
         result = await (self.scraper.check(search) if hasattr(self.scraper, 'check')
                         else self.scraper.fetch(search.url))
         self.last_cycle_sec = time.monotonic() - started
-        self.db.set(f'next_poll:{self.source_id}', str(time.time() + self.delay()))
+        self.db.set(f'next_poll:{self.source_id}', str(time.time() + interval))
         await self._handle(result, search.url)
         return True
 
@@ -466,22 +481,33 @@ class Monitor:
             self.db.set(f'rate_limit_streak:{self.source_id}', str(level))
             server_until, until = rate_limit_terms(time.time(), result.retry_after_sec, self.cfg.cooldown_seconds,
                                                    level, self.cfg.max_backoff_seconds)
-            changed = self.db.save_source_state(self.source_id, city, SourceState.RATE_LIMITED, until,
-                                                'HTTP 429' if level == 1 else 'repeated HTTP 429',
-                                                result.http_status, server_until)
+            # The 429 page shown in the window may be Avito's passable "IP problem" check.
+            passable = (bool(result.diagnostics.get('verification_page'))
+                        and diagnostics['actual_mode'] == 'page_navigation')
+            reason = IP_CHECK_REASON if passable else ('HTTP 429' if level == 1 else 'repeated HTTP 429')
+            self.db.save_source_state(self.source_id, city, SourceState.RATE_LIMITED, until, reason,
+                                      result.http_status, server_until)
+            if passable:
+                saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
+                self.verification.note_restriction(city, saved['since'], True)
+                if hasattr(self.scraper, 'set_window'):
+                    await self.scraper.set_window('normal')
             self.status = f'{SourceState.RATE_LIMITED}: новый HTTP 429'
             self._event('source_rate_limited', correlation_id=correlation_id, city=city, result='http_429',
                         http_status=result.http_status, retry_after_sec=result.retry_after_sec,
-                        until=until, level=level, term='server' if server_until else 'local')
-            if changed:
-                term = ('срок Авито (Retry-After)' if server_until
-                        else f'локальная пауза бота {_left(until - time.time())}, Авито срок не указал')
-                await self.alert('Авито ограничил частоту: новый HTTP 429\n' + answered
-                                 + f'Пауза до {datetime.fromtimestamp(until).strftime("%d.%m %H:%M")}: {term}. '
-                                 'Повторных запросов до этого времени нет, затем сбор продолжится сам. '
-                                 'Очередь Telegram работает.')
-            else:
-                log.warning('Repeated HTTP 429 level=%s; local pause until %s', level, _when(until))
+                        until=until, level=level, term='server' if server_until else 'local', passable=passable)
+            log.warning('HTTP 429 level=%s passable=%s; pause until %s', level, passable, _when(until))
+            # Every 429 is a new answer (requests stop until its term), so each one is reported.
+            term = ('срок Авито (Retry-After)' if server_until
+                    else f'локальная пауза бота {_left(until - time.time())}, Авито срок не указал')
+            text = ('Авито ограничил частоту: новый HTTP 429\n' + answered
+                    + f'Пауза до {datetime.fromtimestamp(until).strftime("%d.%m %H:%M")}: {term}. '
+                    'Повторных запросов до этого времени нет, затем сбор продолжится сам. ')
+            if passable:
+                text += ('\nНа странице «Доступ ограничен: проблема с IP» Авито предлагает проверку. Окно Chrome '
+                         'бота открыто: нажмите «Продолжить» и пройдите её — бот сам увидит обычную выдачу'
+                         + (' и продолжит сбор сразу. ' if not server_until else ', а сбор начнётся после срока Авито. '))
+            await self.alert(text + 'Очередь Telegram работает.')
         elif status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
             state = SourceState.VERIFICATION_REQUIRED if status is FetchStatus.CHALLENGE else SourceState.ACCESS_DENIED
             server_until = until = time.time() + result.retry_after_sec if result.retry_after_sec else None
@@ -636,7 +662,7 @@ class Monitor:
                                   run_id=getattr(self.scraper, 'run_id', None))
         now = time.time()
         # The confirmed page is an observation: the next scheduled check keeps the normal interval.
-        self.db.set(f'next_poll:{self.source_id}', str(now + self.delay()))
+        self.db.set(f'next_poll:{self.source_id}', str(now + self.next_delay()))
         terms = {s['city']: s['server_until'] for s in states if (s.get('server_until') or 0) > now}
         self._event('verification_confirmed', city=result.city, result=result.status.value,
                     cities=[s['city'] for s in states], server_term=bool(terms))
@@ -717,7 +743,7 @@ class Monitor:
                 lines.extend(html.escape('  ' + line) for line in self.restriction_details(s, now))
             else:
                 lines.append(html.escape(f"{s['city']}: {s['state']}"))
-        if any(s['state'] in USER_STATES for s in states):
+        if self.verification.pending():
             lines.append('Проверка в браузере: ' + html.escape(self.verification.describe()))
         try:
             from .metrics import availability_report

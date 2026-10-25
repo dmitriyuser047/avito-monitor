@@ -433,3 +433,106 @@ def test_restored_captcha_is_confirmed_after_unblock_shows_the_check(tmp_path):
         assert state(db)['state'] == SourceState.AVAILABLE and scraper.page.goto.await_count == 1
         db.close()
     asyncio.run(scenario())
+
+
+IP_PAGE = dict(blocked=True, items=[])  # «Доступ ограничен: проблема с IP» with a «Продолжить» check
+
+
+def test_429_ip_check_page_is_shown_and_lifted_by_passing_it(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        scraper = source(tmp_path, catalog(100), mode='page_navigation')
+        alert = AsyncMock()
+        mon = Monitor(config(tmp_path, mode='page_navigation'), db, scraper, alert)
+        assert await mon.poll_once()
+        respond(scraper, IP_PAGE, code=429)
+        db.set('next_poll:local_browser', '0')
+        assert await mon.poll_once()
+        saved = state(db)
+        assert saved['state'] == SourceState.RATE_LIMITED and saved['reason'] == 'HTTP 429 IP check'
+        assert saved['next_allowed_at'] > time.time() + 800 and saved['server_until'] is None
+        scraper.set_window.assert_awaited_with('normal')
+        assert '«Продолжить»' in alert.await_args.args[0] and 'продолжит сбор сразу' in alert.await_args.args[0]
+        assert 'можно пройти проверку' in mon.health_text()
+        for _ in range(3):  # the check is still on screen: local reads only
+            assert not await mon.poll_once()
+        assert state(db)['state'] == SourceState.RATE_LIMITED
+        respond(scraper, catalog(100))  # the user pressed «Продолжить» and passed the check
+        assert not await mon.poll_once()
+        assert state(db)['state'] == SourceState.AVAILABLE  # long before the local pause ends
+        assert alert.await_args.args[0].startswith('Доступ к Авито восстановлен')
+        assert scraper.page.goto.await_count == 2 and db.get('rate_limit_streak:local_browser') == '0'
+        db.close()
+    asyncio.run(scenario())
+
+
+def test_429_ip_check_keeps_retry_after_after_passing(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        scraper = source(tmp_path, IP_PAGE, mode='page_navigation', code=429, headers={'retry-after': '3600'})
+        alert = AsyncMock()
+        mon = Monitor(config(tmp_path, mode='page_navigation'), db, scraper, alert)
+        assert await mon.poll_once()
+        assert 'сбор начнётся после срока Авито' in alert.await_args.args[0]
+        respond(scraper, catalog(100))
+        assert not await mon.poll_once()
+        saved = state(db)
+        assert saved['state'] == SourceState.RATE_LIMITED and saved['next_allowed_at'] > time.time() + 3500
+        assert alert.await_args.args[0].startswith('Проверка пройдена')
+        assert scraper.page.goto.await_count == 1
+        db.close()
+    asyncio.run(scenario())
+
+
+def test_plain_429_page_is_not_offered_as_a_check(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        scraper = source(tmp_path, dict(items=[]), mode='page_navigation', code=429)
+        mon = Monitor(config(tmp_path, mode='page_navigation'), db, scraper, AsyncMock())
+        assert await mon.poll_once()
+        assert state(db)['reason'] == 'HTTP 429'
+        scraper.page.evaluate.return_value = catalog(100)
+        reads = scraper.page.evaluate.await_count
+        for _ in range(3):
+            assert not await mon.poll_once()
+        assert scraper.page.evaluate.await_count == reads and state(db)['state'] == SourceState.RATE_LIMITED
+        db.close()
+    asyncio.run(scenario())
+
+
+def test_light_fetch_429_is_followed_by_a_navigation(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        scraper = source(tmp_path, catalog(100))
+        alert = AsyncMock()
+        mon = Monitor(config(tmp_path), db, scraper, alert)
+        assert await mon.poll_once()  # warm-up navigation
+        scraper.page.evaluate.side_effect = [dict(status=429, items=[])]  # off-page fetch answer
+        db.set('next_poll:local_browser', '0')
+        assert await mon.poll_once()
+        assert scraper.page.goto.await_count == 1 and not scraper.light_ok
+        scraper.page.evaluate.side_effect = None
+        respond(scraper, IP_PAGE, code=429)
+        expire(db)
+        assert await mon.poll_once()
+        assert scraper.page.goto.await_count == 2  # navigated: the check page is now in the window
+        assert state(db)['reason'] == 'HTTP 429 IP check'
+        assert alert.await_count == 2  # every new 429 is reported
+        db.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('draw', [0.7, 1.3])
+def test_check_interval_has_random_spread(tmp_path, monkeypatch, draw):
+    async def scenario():
+        import avito_bot.monitor as monitor_module
+        monkeypatch.setattr(monitor_module.random, 'uniform', lambda a, b: draw if (a, b) == (0.7, 1.3) else 1)
+        db = database(tmp_path)
+        cfg = config(tmp_path, mode='page_navigation')
+        mon = Monitor(cfg, db, source(tmp_path, catalog(100), mode='page_navigation'), AsyncMock())
+        started = time.time()
+        assert await mon.poll_once()
+        planned = float(db.get('next_poll:local_browser')) - started
+        assert abs(planned - mon.delay() * draw) < 2
+        db.close()
+    asyncio.run(scenario())

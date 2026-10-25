@@ -40,6 +40,10 @@ class DeliveryState(StrEnum):
     FAILED = 'FAILED'
 
 
+# HTTP 429 answered with Avito's passable "access limited: IP problem" page: the user can lift it in
+# the browser ("Continue" + check); otherwise it ends with its term like any rate limit.
+IP_CHECK_REASON = 'HTTP 429 IP check'
+
 # Waiting for a term: the scheduler itself resumes when next_allowed_at has passed.
 TIMED_STATES = (SourceState.RECOVERING, SourceState.RATE_LIMITED,
                 SourceState.PARSER_ERROR, SourceState.NETWORK_UNAVAILABLE)

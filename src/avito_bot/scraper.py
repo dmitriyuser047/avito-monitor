@@ -363,6 +363,10 @@ class Scraper:
                     log.warning('Cannot write diagnostic sample; source classification is preserved')
             if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
                 self._final_url[url] = raw.get('url', url)
+            elif result.status in (FetchStatus.RATE_LIMITED, FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
+                # The page did not show this answer: the next allowed check navigates, so a passable
+                # check page becomes visible in the window instead of another off-page fetch.
+                self.light_ok = False
             # A restriction is a result, never a reason to make another request here.
             return self._measured(result, measurement, 'light_fetch')
         except Exception as exc:
@@ -381,6 +385,8 @@ class Scraper:
                 # A known HTTP restriction is sufficient, even if the document cannot be inspected.
                 result = parse_result(dict(status=code, retry_after=headers.get('retry-after')),
                                       self.source_id, _city(url))
+                if code == 429:
+                    result.diagnostics['verification_page'] = await self._shows_check()
                 return self._measured(result, measurement, 'page_navigation', is_warmup)
             result = await self.read_current(url, code, headers.get('retry-after'))
             if result.status is FetchStatus.PARSE_CHANGED and code not in (403, 429, 439):
@@ -405,6 +411,14 @@ class Scraper:
                                       self.source_id, _city(url))
                 return self._measured(result, measurement, 'page_navigation', is_warmup)
             return self._measured(self._error(url, exc, code), measurement, 'page_navigation', is_warmup)
+
+    async def _shows_check(self) -> bool:
+        """Is the loaded 429 page Avito's passable block/check page? Reads the open document only."""
+        try:
+            raw = await asyncio.wait_for(self.page.evaluate(f'({INSPECT_FN})(document)'), 5)
+            return bool(raw.get('blocked') or raw.get('challenge'))
+        except Exception:
+            return False
 
     async def read_current(self, url: str | None = None, code: int | None = None,
                            retry_after: str | None = None) -> FetchResult:

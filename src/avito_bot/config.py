@@ -72,6 +72,11 @@ class Config:
     fetch_mode: str = 'light_fetch'
     browser_channel: str = 'chrome'
 
+    browser_session_mode: str = 'managed'
+    cdp_endpoint: str = 'http://127.0.0.1:9222'
+    cdp_profile_dir: Path = field(default=ROOT / 'data/chrome-cdp-profile')
+    startup_diagnostics: bool = False
+
     @property
     def feed_url(self) -> str:
         return feed_url(self.city, self.feed)
@@ -102,11 +107,15 @@ def load_config() -> Config:
         price_drop_percent=float(os.environ.get("PRICE_DROP_PERCENT", "10")),
         daily_report_hour=int(os.environ.get("DAILY_REPORT_HOUR", "9")),
         poll_jitter=float(os.environ.get("POLL_JITTER", "0.3")),
+        browser_session_mode=os.environ.get('BROWSER_SESSION_MODE', 'managed').strip().lower(),
+        cdp_endpoint=os.environ.get('CDP_ENDPOINT', 'http://127.0.0.1:9222').strip(),
+        cdp_profile_dir=Path(os.environ.get('CDP_PROFILE_DIR', str(ROOT / 'data/chrome-cdp-profile'))).expanduser().resolve(),
+        startup_diagnostics=os.environ.get('STARTUP_DIAGNOSTICS', '0') == '1',
         browser_engine=os.environ.get('BROWSER_ENGINE', 'playwright').strip().lower(),
         fetch_mode=os.environ.get('FETCH_MODE', 'light_fetch').strip().lower(),
         browser_channel=os.environ.get('BROWSER_CHANNEL', 'chrome').strip().lower(),
     )
-    for name, allowed in (('browser_engine', ('playwright', 'patchright')),
+    for name, allowed in (('browser_session_mode', ('managed', 'cdp_attach')), ('browser_engine', ('playwright', 'patchright')),
                           ('fetch_mode', ('light_fetch', 'page_navigation')),
                           ('browser_channel', ('chrome', 'chromium'))):
         if getattr(cfg, name) not in allowed:

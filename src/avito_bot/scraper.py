@@ -4,6 +4,7 @@ Restrictions are handled by Monitor using one source identity across all setting
 Browser/profile selection is explicit; launch failures never trigger a fallback.
 """
 
+from functools import wraps
 import logging
 import importlib
 import uuid
@@ -14,7 +15,8 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 from pathlib import Path
 
-from .runtime import InstanceLock
+from .browser_session import BrowserSessionManager
+from .startup_diagnostics import StartupDiagnostics
 
 from .matcher import Item
 from .sources import FetchResult, FetchStatus
@@ -160,13 +162,31 @@ def parse_result(raw: dict, source_id: str, city: str) -> FetchResult:
     return result
 
 
+def owns_page(method):
+    """Serialize page reads/navigation, allowing fetch → load → read_current in the same task."""
+    @wraps(method)
+    async def call(self, *args, **kwargs):
+        task = asyncio.current_task()
+        if getattr(self, '_page_owner', None) is task:
+            return await method(self, *args, **kwargs)
+        async with self.page_lock:
+            self._page_owner = task
+            try:
+                return await method(self, *args, **kwargs)
+            finally:
+                self._page_owner = None
+    return call
+
+
 class Scraper:
     source_id = 'local_browser'
 
     def __init__(self, profile_dir: Path, proxy_url: str | None, headless: bool = False,
                  save_debug_html: bool = False, debug_retention_hours: float = 24,
                  browser_engine: str = 'playwright', fetch_mode: str = 'light_fetch',
-                 browser_channel: str = 'chrome'):
+                 browser_channel: str = 'chrome', *, session_mode: str = 'managed',
+                 cdp_endpoint: str = 'http://127.0.0.1:9222', cdp_profile_dir: Path | None = None,
+                 startup_diagnostics: bool = False):
         self.profile_dir, self.proxy_url, self.headless = profile_dir, proxy_url, headless
         if browser_engine not in ('playwright', 'patchright'):
             raise ValueError('Unknown browser engine')
@@ -175,10 +195,13 @@ class Scraper:
         if browser_channel not in ('chrome', 'chromium'):
             raise ValueError('Unknown browser channel')
         self.browser_engine, self.fetch_mode, self.browser_channel = browser_engine, fetch_mode, browser_channel
-        # Keep the original Playwright paths, so rollback reuses its own session.
-        base = profile_dir if browser_engine == 'playwright' else profile_dir.with_name(profile_dir.name + '-patchright')
-        self.user_data_dir = base.with_name(base.name + '-chrome') if browser_channel == 'chrome' else base
-        self._browser_lock = None
+        self.session_mode = session_mode
+        self.session_manager = BrowserSessionManager(
+            profile_dir, mode=session_mode, engine=browser_engine, channel=browser_channel,
+            headless=headless, proxy_url=proxy_url, cdp_endpoint=cdp_endpoint, cdp_profile_dir=cdp_profile_dir)
+        self.user_data_dir = self.session_manager.session.user_data_dir
+        self.page_lock = self.session_manager.session.lock
+        self.diagnostics = StartupDiagnostics(profile_dir.parent / 'startup-diagnostics.json', startup_diagnostics)
         self._network = None
         self._request_count = self._transferred_bytes = 0
         self._bytes_available = True
@@ -209,49 +232,33 @@ class Scraper:
 
     @property
     def closed(self) -> bool:
-        return self._closed or bool(self.page and self.page.is_closed())
+        return (self._closed or bool(self.page and self.page.is_closed())
+                or bool(self._pw and not self.session_manager.session.connected))
 
     async def start(self) -> None:
-        if self._pw or self.ctx:
-            raise RuntimeError('Browser already started')
+        session = self.session_manager.session
+        session.proxy_url = self.proxy_url
         try:
-            api = importlib.import_module(f'{self.browser_engine}.async_api')
-        except ImportError as exc:
-            command = 'uv sync --frozen --extra experimental' if self.browser_engine == 'patchright' else 'uv sync --frozen'
-            log.error('Selected engine %s is unavailable. Install it: %s', self.browser_engine, command)
-            raise RuntimeError(f'Selected engine {self.browser_engine} is not installed; run {command}') from exc
-        self.profile_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lock = InstanceLock(self.profile_dir.parent / 'browser.lock')
-        try:
-            lock.__enter__()
-        except BlockingIOError:
-            raise RuntimeError('Another browser engine is running; stop it first') from None
-        self._browser_lock = lock
-        try:
-            self.user_data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self.user_data_dir.chmod(0o700)
+            await self.session_manager.start()
+            self.ctx = session.ctx
+            self.page = await self.session_manager.get_avito_page()
+            self._pw = session.pw
             self._closed = False
             self.light_ok = False
             self._initial_load = True
             self._final_url.clear()
-            self.run_id = uuid.uuid4().hex
-            self._pw = await api.async_playwright().start()
-            self.ctx = await self._pw.chromium.launch_persistent_context(
-                str(self.user_data_dir), channel=self.browser_channel, headless=self.headless,
-                proxy={'server': self.proxy_url} if self.proxy_url else None,
-                locale='ru-RU', timezone_id='Europe/Moscow', no_viewport=True,
-                args=['--window-size=1400,900'])
-            log.info('Browser engine=%s channel=%s mode=%s',
-                     self.browser_engine, self.browser_channel, self.fetch_mode)
-            self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
-            self.ctx.on('close', lambda *_: setattr(self, '_closed', True))
+            self.run_id = session.epoch
+            self.navigation_generation = 0
             self.page.on('framenavigated', self._on_navigated)
             self.page.on('close', lambda *_: setattr(self, '_closed', True))
             await self._start_network_metrics()
-            await self.set_window('minimized')
+            self.diagnostics.update(connection='connected', session_mode=self.session_mode,
+                                    engine=self.browser_engine, profile='persistent',
+                                    route=('proxy' if self.proxy_url else 'direct')
+                                    if self.session_mode == 'managed' else 'unknown')
+            if self.session_mode == 'managed':
+                await self.set_window('minimized')
         except BaseException:
-            log.error('Cannot start %s/%s; check browser installation and profile access. No fallback was attempted.',
-                      self.browser_engine, self.browser_channel)
             await self.stop()
             raise
 
@@ -266,7 +273,8 @@ class Scraper:
         from .sources import SourceHealth
         return SourceHealth(started=self.ctx is not None, closed=self.closed,
                             detail=dict(engine=self.browser_engine, channel=self.browser_channel,
-                                        mode=self.fetch_mode, run_id=self.run_id, last_error=self.last_error))
+                                        mode=self.fetch_mode, run_id=self.run_id, last_error=self.last_error,
+                                        session=await self.session_manager.health()))
 
     async def close(self) -> None:
         await self.stop()
@@ -279,6 +287,8 @@ class Scraper:
             session = await self.ctx.new_cdp_session(self.page)
             session.on('Network.requestWillBeSent', self._count_request)
             session.on('Network.loadingFinished', self._count_bytes)
+            session.on('Network.responseReceived', self.diagnostics.response)
+            session.on('Network.loadingFailed', self.diagnostics.finished)
             session.on('disconnected', lambda *_: setattr(self, '_network', None))
             await session.send('Network.enable')
             self._network = session
@@ -292,8 +302,10 @@ class Scraper:
 
     def _count_request(self, _event) -> None:
         self._request_count += 1
+        self.diagnostics.request(_event)
 
     def _count_bytes(self, event) -> None:
+        self.diagnostics.finished(event)
         length = event.get('encodedDataLength')
         if not isinstance(length, (int, float)) or not math.isfinite(length) or length < 0:
             self._bytes_available = False
@@ -302,24 +314,27 @@ class Scraper:
 
     async def stop(self) -> None:
         try:
-            try:
-                if self.ctx:
-                    await self.ctx.close()
-            finally:
-                if self._pw:
-                    await self._pw.stop()
+            if self._network:
+                try:
+                    await self._network.detach()
+                except Exception:
+                    pass
+            await self.session_manager.disconnect()
         finally:
             self.ctx = self.page = self._pw = self._network = None
             self._closed = True
-            if self._browser_lock:
-                self._browser_lock.__exit__(None, None, None)
-                self._browser_lock = None
+            self.diagnostics.update(connection='disconnected')
 
     def _measurement(self):
         return time.monotonic(), self._request_count, self._transferred_bytes
 
     def _measured(self, result: FetchResult, measurement, actual_mode: str, is_warmup: bool = False) -> FetchResult:
         started, requests, transferred = measurement
+        self.diagnostics.update(last_http_status=result.http_status,
+                                browser_page=('catalog' if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS)
+                                              else 'challenge' if result.status == FetchStatus.CHALLENGE
+                                              or result.diagnostics.get('verification_page') else 'blocked'
+                                              if result.status == FetchStatus.BLOCKED else 'unknown'))
         result.diagnostics.update(
             browser_engine=self.browser_engine, fetch_mode=self.fetch_mode,
             browser_channel=self.browser_channel, actual_mode=actual_mode, run_id=self.run_id,
@@ -330,7 +345,7 @@ class Scraper:
         return result
 
     async def set_window(self, state: str) -> None:
-        if self.headless or self.closed or not self.page:
+        if self.session_mode == 'cdp_attach' or self.headless or self.closed or not self.page:
             return
         cdp = None
         try:
@@ -346,6 +361,7 @@ class Scraper:
                 except Exception:
                     pass
 
+    @owns_page
     async def fetch(self, url: str) -> FetchResult:
         if self.fetch_mode == 'page_navigation' or not self.light_ok:
             return await self.load(url)
@@ -372,12 +388,14 @@ class Scraper:
         except Exception as exc:
             return self._measured(self._error(url, exc), measurement, 'light_fetch')
 
+    @owns_page
     async def load(self, url: str) -> FetchResult:
         measurement = self._measurement()
         code, headers = None, {}
         is_warmup = self._initial_load
         self._initial_load = False  # A failed first load is still measured, never retried as warm-up.
         try:
+            self.diagnostics.begin_navigation(url)
             response = await self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
             code = response.status if response else None
             headers = await response.all_headers() if response else {}
@@ -412,6 +430,9 @@ class Scraper:
                 return self._measured(result, measurement, 'page_navigation', is_warmup)
             return self._measured(self._error(url, exc, code), measurement, 'page_navigation', is_warmup)
 
+        finally:
+            self.diagnostics.end_navigation()
+
     async def _shows_check(self) -> bool:
         """Is the loaded 429 page Avito's passable block/check page? Reads the open document only."""
         try:
@@ -420,6 +441,7 @@ class Scraper:
         except Exception:
             return False
 
+    @owns_page
     async def read_current(self, url: str | None = None, code: int | None = None,
                            retry_after: str | None = None) -> FetchResult:
         url = url or (self.page.url if self.page else '')

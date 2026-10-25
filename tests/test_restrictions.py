@@ -68,7 +68,8 @@ def state(db):
 
 def expire(db):
     with db.conn:
-        db.conn.execute('UPDATE source_state SET next_allowed_at=0')
+        db.conn.execute('UPDATE source_state SET next_allowed_at=0,server_until=0')
+        db.conn.execute("UPDATE access_status SET data_json=json_set(data_json,'$.rate_limit_until',0)")
     db.set('next_poll:local_browser', '0')
 
 

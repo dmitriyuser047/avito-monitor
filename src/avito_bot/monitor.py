@@ -15,6 +15,7 @@ from dataclasses import asdict
 from datetime import datetime
 from urllib.parse import urlparse
 
+from .access_coordinator import AccessCoordinator
 from .config import Config, feed_url
 from .db import DB
 from .matcher import classify, is_fresh, matches
@@ -58,7 +59,7 @@ def backoff(base: float, ceiling: float, level: int) -> float:
 def rate_limit_terms(now: float, retry_after: float | None, base: float, level: int,
                      ceiling: float = 6 * 3600):
     """Server Retry-After binds as given; the local backoff applies only when the server named no term."""
-    if retry_after:
+    if retry_after is not None:
         return now + retry_after, now + retry_after
     return None, now + backoff(base, ceiling, level)
 
@@ -77,6 +78,7 @@ class Monitor:
                  start_source=None):
         self.cfg, self.db, self.scraper, self.alert = cfg, db, scraper, alert
         self.source_id = getattr(scraper, 'source_id', 'local_browser')
+        self.access = AccessCoordinator(db, self.source_id)
         self.recipients = recipients or (lambda: [])
         self.status = 'запуск'
         previous_ok = db.conn.execute("SELECT MAX(fetched_at) FROM fetch_metrics WHERE source_id=?"
@@ -439,7 +441,7 @@ class Monitor:
             self._errors[city] = 0
             self.db.set(f'errors:{self.source_id}:{city}', '0')
             self.db.set(f'rate_limit_streak:{self.source_id}', '0')
-            self.db.save_source_state(self.source_id, city, SourceState.AVAILABLE)
+            self.access.record(result, SourceState.AVAILABLE)
             self._event('catalog_received', correlation_id=correlation_id, city=city, result=status.value,
                         raw_count=len(result.items))
             if before and before['state'] not in (SourceState.AVAILABLE, SourceState.CHECKING):
@@ -491,7 +493,7 @@ class Monitor:
             passable = (bool(result.diagnostics.get('verification_page'))
                         and diagnostics['actual_mode'] == 'page_navigation')
             reason = IP_CHECK_REASON if passable else ('HTTP 429' if level == 1 else 'repeated HTTP 429')
-            self.db.save_source_state(self.source_id, city, SourceState.RATE_LIMITED, until, reason,
+            self.access.record(result, SourceState.RATE_LIMITED, until, reason,
                                       result.http_status, server_until)
             saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
             # A navigated 429 leaves its own page on screen; after fetch() the page is older than the answer.
@@ -519,7 +521,7 @@ class Monitor:
         elif status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
             state = SourceState.VERIFICATION_REQUIRED if status is FetchStatus.CHALLENGE else SourceState.ACCESS_DENIED
             server_until = until = time.time() + result.retry_after_sec if result.retry_after_sec else None
-            changed = self.db.save_source_state(self.source_id, city, state, until,
+            changed = self.access.record(result, state, until,
                                                 status.value, result.http_status, server_until)
             saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
             # The open document shows the restriction only when it was answered by a navigation.
@@ -549,7 +551,7 @@ class Monitor:
                 delay, state = max(900, delay), SourceState.PARSER_ERROR
             server_until = time.time() + result.retry_after_sec if result.retry_after_sec else None
             until = max(time.time() + delay, server_until or 0)
-            changed = self.db.save_source_state(self.source_id, city, state, until, status.value,
+            changed = self.access.record(result, state, until, status.value,
                                                 result.http_status, server_until)
             saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
             self.verification.note_restriction(city, saved['since'], False)  # an error page proves nothing

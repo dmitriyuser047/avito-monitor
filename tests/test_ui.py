@@ -107,10 +107,11 @@ def test_members_access(tmp_path: Path):
     assert "Доступ" in owner_menu and "Доступ" not in member_menu
 
 
-def test_real_time_in_caption():
+def test_real_time_in_caption(monkeypatch):
     from datetime import datetime
     from avito_bot.matcher import Item, is_fresh
     now = datetime(2026, 10, 24, 12, 30).timestamp()
+    monkeypatch.setattr(ui.time, 'time', lambda: now)
     pub = datetime(2026, 10, 24, 11, 47).timestamp()
     i = Item(1, "RTX 3060", 20000, "https://x", "1 час назад", None, "р-н Советский", "", "tovary_dlya_kompyutera",
              "kazan", published=pub, found_at=pub + 120)
@@ -125,6 +126,21 @@ def test_real_time_in_caption():
     old = Item(2, "x", 1, "", "1 час назад", None, "", "", published=now - 5 * 3600)
     assert not is_fresh(old, now)
     assert is_fresh(Item(3, "x", 1, "", "Вчера", None, "", "", published=now - 600), now)
+
+
+def test_caption_dates_across_days(monkeypatch):
+    from datetime import datetime
+    now = datetime(2026, 10, 25, 12, 30).timestamp()
+    monkeypatch.setattr(ui.time, 'time', lambda: now)
+    pub = datetime(2026, 10, 24, 11, 47).timestamp()
+    item = Item(1, 'RTX 3060', 20000, '', '', None, '', '', published=pub)
+    assert ui.when_text(item) == 'опубликовано вчера в 11:47'
+    item.found_at = datetime(2026, 10, 24, 12, 30).timestamp()
+    assert ui.when_text(item) == 'опубликовано вчера в 11:47, в поиске с 24.10 12:30'
+    item.published = None
+    assert ui.when_text(item) == 'появилось в поиске вчера в 12:30'
+    item.found_at = datetime(2026, 10, 23, 12, 30).timestamp()
+    assert ui.when_text(item) == 'появилось в поиске 23.10 в 12:30'
 
 
 def test_browser_closed_stops_monitor(tmp_path: Path):

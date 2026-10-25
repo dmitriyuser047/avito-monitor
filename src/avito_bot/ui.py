@@ -102,14 +102,28 @@ def clock(ts: float, now: float | None = None) -> str:
 
 def when_text(item: Item) -> str:
     """Реальное время вместо «1 час назад»."""
+    now = time.time()
+
+    def at(ts: float) -> str:
+        value = clock(ts, now)
+        if value.startswith('вчера '):
+            return 'вчера в ' + value.removeprefix('вчера ')
+        if ' ' in value:
+            day, hm = value.split(' ', 1)
+            return f'{day} в {hm}'
+        return 'в ' + value
+
     if item.published:
-        text = f"опубликовано в {clock(item.published)}"
+        text = f"опубликовано {at(item.published)}"
         # после модерации объявление может попасть в поиск заметно позже
         if item.found_at and item.found_at - item.published > 10 * 60:
-            text += f", в поиске с {clock(item.found_at)}"
+            found = datetime.fromtimestamp(item.found_at)
+            since = (found.strftime('%H:%M') if found.date() == datetime.fromtimestamp(now).date()
+                     else found.strftime('%d.%m %H:%M'))
+            text += f", в поиске с {since}"
         return text
     if item.found_at:
-        return f"появилось в поиске в {clock(item.found_at)}"
+        return f"появилось в поиске {at(item.found_at)}"
     return item.date
 
 

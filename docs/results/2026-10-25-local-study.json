@@ -1,0 +1,55 @@
+{
+  "study_id": 1,
+  "source": "local_browser",
+  "status": "complete",
+  "requested_hours": 24.0,
+  "elapsed_hours": 24.0,
+  "sample_count": 93,
+  "sampled_state_seconds": {
+    "WAITING_FOR_USER": 11160.0,
+    "UNOBSERVED": 75240.0
+  },
+  "observer_coverage": 0.12916666666666668,
+  "fetch_count": 0,
+  "successful_fetches": 0,
+  "observed_unique_ids": 0,
+  "matched_unique_ids": 0,
+  "delivered_unique_ids": 0,
+  "publish_to_discovery": {
+    "n": 0,
+    "p50_sec": null,
+    "p95_sec": null,
+    "share_within_60_sec": null
+  },
+  "discovery_to_telegram": {
+    "n": 0,
+    "p50_sec": null,
+    "p95_sec": null,
+    "share_within_60_sec": null
+  },
+  "publish_to_telegram": {
+    "n": 0,
+    "p50_sec": null,
+    "p95_sec": null,
+    "share_within_60_sec": null
+  },
+  "warnings": [
+    "Нет успешных снимков: скорость обнаружения и полноту оценить нельзя.",
+    "Есть периоды без наблюдателя; они не считаются работой источника.",
+    "Менее 100 подтверждённых объявлений: оценка p95 предварительная.",
+    "Первый снимок каждого города исключён из задержек: время его появления ранее неизвестно.",
+    "ID-overlap выявляет возможные пропуски, но не доказывает полноту выдачи без контрольного канала."
+  ],
+  "started_at_moscow": "2026-10-24T15:58:19.917743+03:00",
+  "ended_at_moscow": "2026-10-25T15:58:19.917743+03:00",
+  "requests_before_study": [
+    {
+      "status": "rate_limited",
+      "http_status": 429,
+      "count": 2
+    }
+  ],
+  "final_collection_state": "WAITING_FOR_USER",
+  "database_integrity": "ok",
+  "external_integrations": false
+}

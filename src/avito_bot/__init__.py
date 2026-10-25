@@ -13,6 +13,7 @@ from .db import DB
 from .delivery import DeliveryWorker
 from .direct_proxy import DirectProxy
 from .monitor import Monitor
+from .photo_cache import PhotoCache
 from .runtime import InstanceLock
 from .scraper import Scraper
 from .sources import SourceState
@@ -46,6 +47,9 @@ async def run() -> None:
                           recipients=tg.recipients if tg else None)
         if tg:
             tg.monitor = monitor
+            # Reuse a photo during fan-out to multiple recipients, reducing
+            # separate browser API requests to the same image URL.
+            photo_cache = PhotoCache(scraper.download)
             # Delivery does not need a live browser; photo is optional.
             async def optional_photo(url):
                 if monitor.paused or monitor._source_stopped or any(
@@ -54,7 +58,7 @@ async def run() -> None:
                     for s in db.source_states(scraper.source_id)
                 ):
                     return None
-                return await scraper.download(url)
+                return await photo_cache.get(url)
             tg.fetch_image = optional_photo
             tasks.append(asyncio.create_task(DeliveryWorker(db, tg.send_to_chat, tg.allowed).run(), name='delivery'))
             await tg.setup()

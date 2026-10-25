@@ -90,6 +90,53 @@ def test_direct_proxy_uses_real_selected_loopback_connection():
     asyncio.run(scenario())
 
 
+def test_concurrent_resolves_of_one_name_share_a_single_doh_request():
+    async def scenario():
+        proxy=DirectProxy('127.0.0.1',port=0)
+        async def get(*args,**kwargs):
+            await asyncio.sleep(0.05)
+            return httpx.Response(200,json={'Answer':[{'type':1,'data':'127.0.0.1'}]},request=httpx.Request('GET','https://dns.google/resolve'))
+        proxy._http.get=AsyncMock(side_effect=get)
+        assert await asyncio.gather(*(proxy.resolve('fixture.test') for _ in range(30)))==['127.0.0.1']*30
+        assert proxy._http.get.await_count==1 and not proxy._resolving
+        await proxy.stop()
+    asyncio.run(scenario())
+
+
+def test_cold_browser_burst_of_tunnels_fits_under_launchd_descriptor_limit():
+    # launchd gives agents a soft limit of 256; scale it down: 40 loopback tunnels hold ~160 descriptors.
+    code='''
+import asyncio, resource
+from unittest.mock import AsyncMock
+from avito_bot.direct_proxy import DirectProxy
+from avito_bot.runtime import raise_open_files_limit
+resource.setrlimit(resource.RLIMIT_NOFILE,(64,resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+raise_open_files_limit()
+async def main():
+    async def echo(reader,writer):
+        writer.write(await reader.read(5));await writer.drain();await reader.read();writer.close()
+    upstream=await asyncio.start_server(echo,'127.0.0.1',0)
+    proxy=DirectProxy('127.0.0.1',port=0);proxy.resolve=AsyncMock(return_value='127.0.0.1')
+    await proxy.start()
+    port=proxy._server.sockets[0].getsockname()[1];target=upstream.sockets[0].getsockname()[1]
+    async def tunnel():
+        reader,writer=await asyncio.open_connection('127.0.0.1',port)
+        writer.write(b'CONNECT fixture.test:%d HTTP/1.1\\r\\n\\r\\n'%target)
+        assert (await reader.readuntil(b'\\r\\n\\r\\n')).startswith(b'HTTP/1.1 200')
+        writer.write(b'hello');assert await reader.readexactly(5)==b'hello'
+        return writer
+    writers=await asyncio.gather(*(tunnel() for _ in range(40)))
+    for writer in writers:
+        writer.close()
+    proxy._server.close();upstream.close()
+    await proxy._http.aclose()
+    print('ok')
+asyncio.run(main())
+'''
+    result=subprocess.run([sys.executable,'-c',code],capture_output=True,timeout=30)
+    assert result.returncode==0 and result.stdout.strip()==b'ok', result.stderr.decode()[-2000:]
+
+
 def test_deployment_backup_and_plist_are_private_and_portable(tmp_path):
     import sqlite3
     from avito_bot.service import backup_database, launch_agent

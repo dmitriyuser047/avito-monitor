@@ -40,7 +40,9 @@ class DirectProxy:
                 raise ValueError("На Windows укажите в DIRECT_INTERFACE локальный IP компьютера, например 192.168.1.5")
             self._ifindex = socket.if_nametoindex(interface)  # заодно проверка, что интерфейс есть
         self._dns: dict[str, tuple[str, float]] = {}
-        self._http = httpx.AsyncClient(timeout=10)
+        self._resolving: dict[str, asyncio.Task] = {}
+        # A cold profile asks for dozens of names at once; keep DoH to a few sockets.
+        self._http = httpx.AsyncClient(timeout=10, limits=httpx.Limits(max_connections=4, max_keepalive_connections=2))
         self._server: asyncio.base_events.Server | None = None
 
     @property
@@ -61,6 +63,14 @@ class DirectProxy:
         cached = self._dns.get(name)
         if cached and cached[1] > time.monotonic():
             return cached[0]
+        # Parallel tunnels to one host share a single DoH request.
+        task = self._resolving.get(name)
+        if task is None:
+            task = self._resolving[name] = asyncio.ensure_future(self._query(name))
+            task.add_done_callback(lambda t: (self._resolving.pop(name, None), t.cancelled() or t.exception()))
+        return await asyncio.shield(task)
+
+    async def _query(self, name: str) -> str:
         r = await self._http.get(DOH_URL, params={"name": name, "type": "A"})
         r.raise_for_status()
         answers = [a["data"] for a in r.json().get("Answer", []) if a.get("type") == 1]

@@ -13,7 +13,7 @@ from .delivery import DeliveryWorker
 from .direct_proxy import DirectProxy
 from .monitor import Monitor
 from .photo_cache import PhotoCache
-from .runtime import InstanceLock
+from .runtime import InstanceLock, raise_open_files_limit
 from .scraper import Scraper
 from .sources import SourceState
 
@@ -124,6 +124,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s', handlers=handlers)
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logging.getLogger('aiogram.event').setLevel(logging.WARNING)
+    log.info('Open files limit: %s', raise_open_files_limit())
     try:
         with InstanceLock(cfg.data_dir / 'bot.lock'):
             asyncio.run(run())

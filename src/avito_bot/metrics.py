@@ -181,11 +181,94 @@ def comparison_report(conn, since=0, until=1e20):
                        'Delivery quantiles count recipients and retain original detection attribution.'])
 
 
+def service_uptime(conn, since: float, until: float) -> dict:
+    """Process lifetime from start/stop events; a crash without a stop event ends at its last event."""
+    events = list(conn.execute("SELECT at,kind FROM events WHERE at<? ORDER BY at,id", (until,)))
+    starts = [i for i, (_, kind) in enumerate(events) if kind == 'service_started']
+    covered = 0.0
+    for n, index in enumerate(starts):
+        start = events[index][0]
+        limit = events[starts[n + 1]][0] if n + 1 < len(starts) else None
+        tail = [at for at, kind in events[index + 1:] if limit is None or at < limit]
+        stopped = next((at for at, kind in events[index + 1:]
+                        if kind == 'service_stopped' and (limit is None or at < limit)), None)
+        if stopped is not None:
+            end = stopped
+        elif limit is None:
+            end = until  # still running
+        else:
+            end = tail[-1] if tail else start  # crashed: count only what was observed
+        covered += max(0.0, min(end, until) - max(start, since))
+    window = until - since
+    return dict(seconds=round(covered, 1), share=round(covered / window, 4) if window > 0 else None,
+                starts=sum(1 for i in starts if events[i][0] >= since))
+
+
+def availability_report(conn, since: float = 0, until: float | None = None) -> dict:
+    """\"The bot works\" and \"the source is available\" are reported separately."""
+    import time
+    until = time.time() if until is None else until
+    if since <= 0:
+        first = conn.execute('SELECT MIN(at) FROM events').fetchone()[0]
+        since = first if first is not None else until
+    checks = list(conn.execute("SELECT result,details_json FROM events WHERE kind='source_checked'"
+                               " AND at>=? AND at<?", (since, until)))
+    details = [json.loads(d) for _, d in checks]
+    results = [r for r, _ in checks]
+    recoveries = [json.loads(d).get('recovery_sec') for (d,) in conn.execute(
+        "SELECT details_json FROM events WHERE kind='source_recovered' AND city IS NOT NULL AND at>=? AND at<?",
+        (since, until))]
+    def count(kind):
+        return conn.execute('SELECT COUNT(*) FROM events WHERE kind=? AND at>=? AND at<?',
+                            (kind, since, until)).fetchone()[0]
+    traffic = conn.execute('SELECT COUNT(request_count),SUM(request_count),COUNT(transferred_bytes),'
+                           'SUM(transferred_bytes) FROM fetch_metrics WHERE fetched_at>=? AND fetched_at<?',
+                           (since, until)).fetchone()
+    latency = []
+    for seen, sent in conn.execute("SELECT i.first_seen_at,o.sent_at FROM notification_outbox o JOIN items i"
+                                   " USING(item_id) WHERE o.status='sent' AND o.sent_at>=? AND o.sent_at<?",
+                                   (since, until)):
+        if sent >= seen:
+            latency.append(sent - seen)
+    publish = []
+    for payload, sent in conn.execute("SELECT i.payload_json,o.sent_at FROM notification_outbox o JOIN items i"
+                                      " USING(item_id) WHERE o.status='sent' AND o.sent_at>=? AND o.sent_at<?",
+                                      (since, until)):
+        published = json.loads(payload)['item'].get('published')
+        if published and sent >= published:
+            publish.append(sent - published)
+    return dict(
+        since=since, until=until,
+        service=service_uptime(conn, since, until),
+        source=dict(checks=len(results),
+                    success_share=round(sum(r in SUCCESS for r in results) / len(results), 4) if results else None,
+                    http_403=sum(d.get('http_status') == 403 for d in details),
+                    http_429=sum(d.get('http_status') == 429 or r == 'rate_limited' for r, d in zip(results, details)),
+                    verification_required=count('verification_required'),
+                    verification_confirmed=count('verification_confirmed'),
+                    network_or_parser_errors=sum(r in ('network_error', 'parse_changed') for r in results),
+                    recovery_sec=distribution(v for v in recoveries if isinstance(v, (int, float))),
+                    component_failures=count('source_failed')),
+        listings=dict(unique_discovered=conn.execute(
+            "SELECT COUNT(DISTINCT result) FROM events WHERE kind='listing_discovered' AND at>=? AND at<?",
+            (since, until)).fetchone()[0], staged=count('listing_staged')),
+        delivery=dict(confirmed=count('telegram_delivery_confirmed'),
+                      queue=dict(conn.execute('SELECT status,COUNT(*) FROM notification_outbox GROUP BY status')),
+                      detection_to_telegram_sec=distribution(latency),
+                      publication_to_telegram_sec=distribution(publish)),
+        traffic=dict(measured_checks=traffic[0], requests=traffic[1], measured_byte_checks=traffic[2],
+                     transferred_bytes=traffic[3]),
+        notes=['Service uptime is the process lifetime, not source availability.',
+               'Source success share counts checks; Avito availability cannot be guaranteed.',
+               'Traffic counts collection-time page requests only; bytes are approximate.'])
+
+
 def main():
     parser = argparse.ArgumentParser()
     output = parser.add_mutually_exclusive_group()
     output.add_argument('--events', action='store_true', help='Export detection/delivery rows as CSV')
     output.add_argument('--compare', action='store_true', help='Aggregate four sequential engine/mode combinations')
+    output.add_argument('--availability', action='store_true', help='Service uptime, source availability, delivery')
     parser.add_argument('--since', type=float, default=0, help='Detection/fetch start, Unix seconds inclusive')
     parser.add_argument('--until', type=float, default=1e20, help='Detection/fetch end, Unix seconds exclusive')
     parser.add_argument('--db', type=Path, help='SQLite path (read-only)')
@@ -205,6 +288,11 @@ def main():
             writer.writerows(detection_events(conn, args.since, args.until))
         elif args.compare:
             print(json.dumps(comparison_report(conn, args.since, args.until), indent=2))
+        elif args.availability:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='events'").fetchone():
+                parser.error('Database has no events yet; start the updated application to migrate it')
+            until = None if args.until >= 1e20 else args.until
+            print(json.dumps(availability_report(conn, args.since, until), indent=2, ensure_ascii=False))
         else:
             conn.row_factory = sqlite3.Row
             # Whitelist fields: no tokens, payloads, cookies, query text or HTML.
@@ -216,3 +304,5 @@ def main():
             print(json.dumps([dict(row) for row in conn.execute(
                 f'SELECT {select} FROM fetch_metrics WHERE fetched_at>=? AND fetched_at<? ORDER BY id DESC LIMIT 1000',
                 (args.since, args.until))], indent=2))
+if __name__ == '__main__':
+    main()

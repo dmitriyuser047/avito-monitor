@@ -661,6 +661,17 @@ class Monitor:
                 lines.append(html.escape(f"{s['city']}: {s['state']}"))
         if any(s['state'] in USER_STATES for s in states):
             lines.append('Проверка в браузере: ' + html.escape(self.verification.describe()))
+        try:
+            from .metrics import availability_report
+            day = availability_report(self.db.conn, now - 86400, now)
+            src, service = day['source'], day['service']
+            share = f"{src['success_share']:.0%}" if src['success_share'] is not None else '—'
+            recovery = (f", восстановление p50 {_left(src['recovery_sec']['p50'])}" if src['recovery_sec'] else '')
+            lines.append(f"За 24 ч: сервис работал {service['share']:.0%}; проверок {src['checks']}, успешных {share}, "
+                         f"HTTP 429: {src['http_429']}, HTTP 403: {src['http_403']}, "
+                         f"проверок в браузере: {src['verification_required']}{recovery}")
+        except Exception:
+            log.exception('Cannot build the 24h availability summary')
         lines.append(f'Политика 429 без Retry-After: пауза {_left(self.cfg.cooldown_seconds)}, '
                      f'удваивается до {_left(self.cfg.max_backoff_seconds)}; Retry-After соблюдается как есть')
         latency = self.db.latency_stats()

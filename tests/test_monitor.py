@@ -189,4 +189,5 @@ def test_parse_changed_diagnostics_and_backoff(env):
         health=monitor.health_text()
         assert 'parse_changed' in health and 'PARSER_ERROR' in health and 'очередь' in health
         assert 'Сервис: RUNNING' in health and 'затем автоматическая проверка' in health
+        assert 'За 24 ч:' in health and 'проверок 1' in health
     asyncio.run(scenario())

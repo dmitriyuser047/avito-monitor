@@ -460,7 +460,9 @@ class Monitor:
             self.last_ok = result.observed_at
             self._errors[city] = 0
             self.db.set(f'errors:{self.source_id}:{city}', '0')
-            self.db.set(f'rate_limit_streak:{self.source_id}', '0')
+            if not any(s['city'] != city and self._restricting(s, time.time())
+                       for s in self.db.source_states(self.source_id)):
+                self.db.set(f'rate_limit_streak:{self.source_id}', '0')
             self.access.record(result, SourceState.AVAILABLE)
             self._event('catalog_received', correlation_id=correlation_id, city=city, result=status.value,
                         raw_count=len(result.items))

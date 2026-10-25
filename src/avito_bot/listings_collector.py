@@ -31,8 +31,7 @@ class ListingsCollector:
         scraper = self.scraper
         document = self._document()
         # Managed startup stays about:blank. Attached Chrome can already contain the search.
-        if ((getattr(scraper, 'session_mode', 'managed') == 'cdp_attach'
-                or scraper.navigation_generation > 0)
+        if (getattr(scraper, 'session_mode', 'managed') == 'cdp_attach'
                 and document != self._consumed
                 and same_search(getattr(scraper.page, 'url', ''), search.url)):
             measurement = scraper._measurement()

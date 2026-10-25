@@ -53,7 +53,8 @@ def startup_report(cfg):
     lines = [f'Browser session: {cfg.browser_session_mode}', f'Browser engine: {cfg.browser_engine}',
              'Chrome connection: ' + (sample.get('connection', 'unknown') if current else 'unknown'),
              'Profile: persistent',
-             'Proxy: ' + ('enabled' if cfg.browser_session_mode == 'managed' and cfg.direct_interface else 'disabled'),
+             'Proxy: ' + ('unknown' if cfg.browser_session_mode == 'cdp_attach'
+                          else 'enabled' if cfg.direct_interface else 'disabled'),
              'Network route: ' + (sample.get('route', 'unknown') if current else 'unknown'),
              'External IP: unknown',
              'Route mismatch: ' + ('DirectProxy configuration does not control attached Chrome'

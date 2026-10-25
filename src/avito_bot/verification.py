@@ -31,6 +31,11 @@ class VerificationCoordinator:
         return getattr(self.monitor.scraper, 'navigation_generation', 0)
 
     def note_restriction(self, city: str, since: float, dom_shows_restriction: bool) -> None:
+        # A new answer may reuse `since` while RATE_LIMITED persists across a passed check.
+        # It is a fresh restriction, not an already completed event; also bound 24/7 memory use.
+        for key in [key for key in self._baseline if key[0] == city]:
+            self._baseline.pop(key)
+        self._confirmed = {key for key in self._confirmed if key[0] != city}
         self._baseline[(city, since)] = (getattr(self.monitor.scraper, 'run_id', ''),
                                           self._generation(), dom_shows_restriction)
 

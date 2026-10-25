@@ -282,7 +282,10 @@ class TelegramBot:
 
         @r.message(Command("resume"), is_owner)
         async def cmd_resume(m: Message):
-            self.monitor.set_paused(False)
+            try:
+                await m.answer(await self.monitor.resume())
+            except Exception:
+                await m.answer("Браузер недоступен. Проверьте /health и перезапустите бот на компьютере.")
             await self._show(m, self._menu(m.from_user.id))
 
         @r.message(Command("add"))
@@ -316,7 +319,14 @@ class TelegramBot:
                 if to == "resume" and c.from_user.id != self.owner_id:
                     await c.answer("Возобновить опрос может владелец", show_alert=True)
                     return
-                self.monitor.set_paused(to == "pause")
+                if to == "resume":
+                    try:
+                        text = await self.monitor.resume()
+                    except Exception:
+                        text = "Браузер недоступен. Проверьте /health и перезапустите бот на компьютере."
+                    await self.bot.send_message(c.from_user.id, text)
+                else:
+                    self.monitor.set_paused(True)
                 await self._show(c, self._menu(c.from_user.id))
             else:
                 await state.clear()

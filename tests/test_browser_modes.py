@@ -210,6 +210,8 @@ def test_actual_engine_both_modes_offline_and_restart(tmp_path, engine):
                 assert result.diagnostics['request_count'] >= 1
                 assert result.diagnostics['transferred_bytes'] >= 0
             assert warm.diagnostics['actual_mode'] == nav.diagnostics['actual_mode'] == 'page_navigation'
+            assert warm.diagnostics['is_warmup'] is True
+            assert light.diagnostics['is_warmup'] is nav.diagnostics['is_warmup'] is False
             assert light.diagnostics['actual_mode'] == 'light_fetch'
             assert requests.count(URL) == 3
             # APIRequestContext isn't covered by page routing: mock its transport.
@@ -220,6 +222,7 @@ def test_actual_engine_both_modes_offline_and_restart(tmp_path, engine):
             await scraper.stop()
             await scraper.start()
             assert not scraper.closed and not scraper.light_ok
+            assert scraper._initial_load
         finally:
             await scraper.stop()
     asyncio.run(scenario())
@@ -301,4 +304,169 @@ def test_known_http_restriction_survives_broken_response_headers(tmp_path, code)
         assert result.http_status == code and result.diagnostics['access_limited']
         source.page.evaluate.assert_not_awaited()
         source.page.goto.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('mode', ['light_fetch', 'page_navigation'])
+def test_warmup_is_exactly_first_navigation_attempt(tmp_path, mode):
+    async def scenario():
+        scraper = Scraper(tmp_path/'p', None, fetch_mode=mode)
+        raw = dict(status=200, catalog=True, empty=True, items=[])
+        response = SimpleNamespace(status=200, all_headers=AsyncMock(return_value={}))
+        scraper.page = SimpleNamespace(goto=AsyncMock(return_value=response), evaluate=AsyncMock(return_value=raw), url=URL)
+        initial = await scraper.fetch(URL)
+        repeated = await scraper.fetch(URL)
+        assert initial.diagnostics['actual_mode'] == 'page_navigation'
+        assert initial.diagnostics['is_warmup'] is True
+        assert repeated.diagnostics['actual_mode'] == mode
+        assert repeated.diagnostics['is_warmup'] is False
+        assert initial.diagnostics['fetch_mode'] == repeated.diagnostics['fetch_mode'] == mode
+        assert scraper.page.goto.await_count == (1 if mode=='light_fetch' else 2)
+        assert initial.diagnostics['request_count'] is None
+    asyncio.run(scenario())
+
+
+def test_failed_initial_navigation_is_not_repeatedly_excluded_as_warmup(tmp_path):
+    async def scenario():
+        scraper = Scraper(tmp_path/'p', None)
+        scraper.page = SimpleNamespace(goto=AsyncMock(side_effect=TimeoutError()))
+        first = await scraper.fetch(URL)
+        assert first.status is FetchStatus.NETWORK_ERROR and first.diagnostics['is_warmup'] is True
+        assert scraper.page.goto.await_count == 1
+        # A separate explicit call models a later scheduler attempt; fetch never retries internally.
+        second = await scraper.fetch(URL)
+        assert second.status is FetchStatus.NETWORK_ERROR and second.diagnostics['is_warmup'] is False
+        assert second.diagnostics['actual_mode'] == 'page_navigation'
+        assert scraper.page.goto.await_count == 2
+    asyncio.run(scenario())
+
+
+def test_manual_first_load_consumes_warmup_without_reclassifying_following_fetch(tmp_path):
+    async def scenario():
+        scraper = Scraper(tmp_path/'p', None)
+        response = SimpleNamespace(status=200, all_headers=AsyncMock(return_value={}))
+        scraper.page = SimpleNamespace(goto=AsyncMock(return_value=response), url=URL,
+                                       evaluate=AsyncMock(return_value=dict(catalog=True, empty=True, items=[], status=200)))
+        manual = await scraper.load(URL)
+        normal = await scraper.fetch(URL)
+        assert manual.diagnostics['is_warmup'] and not normal.diagnostics['is_warmup']
+        assert normal.diagnostics['actual_mode'] == 'light_fetch'
+        scraper.page.goto.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('mode', ['light_fetch', 'page_navigation'])
+def test_timeout_has_null_unavailable_counters_and_no_retry(tmp_path, mode):
+    async def scenario():
+        scraper = Scraper(tmp_path/'p', None, fetch_mode=mode)
+        scraper.light_ok = True
+        scraper.page = SimpleNamespace(evaluate=AsyncMock(side_effect=TimeoutError()), goto=AsyncMock(side_effect=TimeoutError()))
+        result = await scraper.fetch(URL)
+        assert result.status is FetchStatus.NETWORK_ERROR
+        assert result.diagnostics['duration_sec'] >= 0
+        assert result.diagnostics['request_count'] is None and result.diagnostics['transferred_bytes'] is None
+        assert scraper.page.goto.await_count + scraper.page.evaluate.await_count == 1
+    asyncio.run(scenario())
+
+
+def test_missing_byte_lengths_and_disconnected_cdp_are_null(tmp_path, monkeypatch):
+    async def scenario():
+        api = fake_api(monkeypatch)
+        scraper = Scraper(tmp_path/'p', None, headless=True)
+        await scraper.start()
+        try:
+            scraper.light_ok = True
+            api.page.evaluate = AsyncMock(return_value=dict(status=200, catalog=True, empty=True, items=[]))
+            scraper._count_bytes({})
+            result = await scraper.fetch(URL)
+            assert result.diagnostics['transferred_bytes'] is None
+            assert result.diagnostics['request_count'] == 0  # Available, and no requests in this mock.
+            disconnect = next(c.args[1] for c in api.cdp.on.call_args_list if c.args[0]=='disconnected')
+            disconnect()
+            result = await scraper.fetch(URL)
+            assert result.diagnostics['request_count'] is None and result.diagnostics['transferred_bytes'] is None
+        finally:
+            await scraper.stop()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('engine', ['playwright', 'patchright'])
+def test_service_page_fixtures_in_both_actual_modes_offline(tmp_path, engine):
+    pytest.importorskip(f'{engine}.async_api')
+    cases = [
+        ('blocked', 200, FetchStatus.BLOCKED, 'blocked_title'),
+        ('blocked-ip', 200, FetchStatus.BLOCKED, 'blocked_text'),
+        ('challenge', 200, FetchStatus.CHALLENGE, 'captcha_marker'),
+        ('challenge-frame', 200, FetchStatus.CHALLENGE, 'captcha_marker'),
+        ('challenge-browser', 200, FetchStatus.CHALLENGE, 'challenge_text'),
+        ('blocked-with-captcha', 200, FetchStatus.CHALLENGE, 'captcha_marker'),
+        ('unknown-empty-text', 200, FetchStatus.PARSE_CHANGED, None),
+        ('empty-marker', 200, FetchStatus.NO_RESULTS, None),
+        ('catalog-service-words', 200, FetchStatus.OK, None),
+        ('changed', 200, FetchStatus.PARSE_CHANGED, None),
+        ('catalog', 403, FetchStatus.BLOCKED, 'http_403'),
+        ('challenge', 429, FetchStatus.RATE_LIMITED, 'http_429'),
+        ('blocked', 439, FetchStatus.CHALLENGE, 'http_439'),
+        ('changed', 503, FetchStatus.NETWORK_ERROR, None),
+    ]
+    async def scenario():
+        scraper = Scraper(tmp_path/'p', None, headless=True, browser_engine=engine,
+                          browser_channel=os.environ.get('AVITO_TEST_BROWSER_CHANNEL','chrome'))
+        selected, requests = {}, []
+        async def route(route):
+            if route.request.url == URL:
+                requests.append(URL)
+                await route.fulfill(status=selected['code'],body=(FIXTURES/(selected['name']+'.html')).read_text(),
+                                    headers={'content-type':'text/html; charset=utf-8','retry-after':'120'})
+            else:
+                await route.fulfill(status=200,body='<html></html>',content_type='text/html')
+        try:
+            await scraper.start()
+            await scraper.ctx.route('**/*', route)
+            await scraper.page.goto('https://fixture.test/')
+            scraper.page.wait_for_selector = AsyncMock()  # No real asynchronous rendering in static fixtures.
+            for mode in ('light_fetch','page_navigation'):
+                scraper.fetch_mode = mode
+                scraper.light_ok = True
+                for name, code, status, reason in cases:
+                    selected.update(name=name,code=code)
+                    before = len(requests)
+                    result = await scraper.fetch(URL)
+                    assert result.status is status, (engine,mode,name,result)
+                    assert result.http_status == code
+                    assert result.diagnostics.get('restriction_reason') == reason
+                    assert result.diagnostics['actual_mode'] == mode
+                    assert len(requests) == before+1  # No extra request for classification.
+                    if reason:
+                        assert result.diagnostics['access_limited']
+                    if code == 429:
+                        assert result.retry_after_sec == 120
+        finally:
+            await scraper.stop()
+    asyncio.run(scenario())
+
+
+def test_inspection_error_preserves_known_http_status(tmp_path):
+    async def scenario():
+        scraper = Scraper(tmp_path/'p', None, fetch_mode='page_navigation')
+        response = SimpleNamespace(status=200, all_headers=AsyncMock(return_value={}))
+        scraper.page = SimpleNamespace(goto=AsyncMock(return_value=response), evaluate=AsyncMock(side_effect=RuntimeError()))
+        result = await scraper.fetch(URL)
+        assert result.status is FetchStatus.NETWORK_ERROR and result.http_status==200
+        scraper.page.goto.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+def test_debug_sample_write_failure_cannot_hide_challenge(tmp_path):
+    async def scenario():
+        scraper = Scraper(tmp_path/'p', None, save_debug_html=True)
+        scraper.light_ok = True
+        scraper.sample_path = tmp_path  # Writing text to a directory fails on all supported OSes.
+        scraper.page = SimpleNamespace(evaluate=AsyncMock(return_value=dict(status=200,challenge=True,items=[],html='<html>safe</html>')))
+        scraper.load = AsyncMock()
+        result = await scraper.fetch(URL)
+        assert result.status is FetchStatus.CHALLENGE and result.http_status==200
+        assert result.diagnostics['access_limited']
+        scraper.load.assert_not_awaited()
+        scraper.page.evaluate.assert_awaited_once()
     asyncio.run(scenario())

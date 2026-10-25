@@ -45,7 +45,11 @@ def test_restrictions_stop_all_cities_and_survive_restart(env,status):
             assert not await monitor.poll_once()
         restarted=Monitor(cfg,db,source,alert)
         assert not await restarted.poll_once()
-        assert len(source.calls)==1 and alert.await_count==1
+        # The restart reports the saved restriction once and never as a new answer from Avito.
+        assert len(source.calls)==1 and alert.await_count==2
+        assert alert.await_args.args[0].startswith('Сохранённое ограничение с прошлого запуска')
+        assert 'старая сохранённая блокировка' in alert.await_args.args[0]
+        assert not await restarted.poll_once() and alert.await_count==2
         assert db.source_states('test')[0]['next_allowed_at']>time.time()+3500
     asyncio.run(scenario())
 
@@ -74,8 +78,11 @@ def test_manual_resume_is_required_after_block(env):
         db.set('next_poll:test','0')
         source.status=FetchStatus.NO_RESULTS
         assert not await monitor.poll_once()
-        monitor.set_paused(False)
-        assert await monitor.poll_once()
+        # /resume never lifts an unconfirmed block; this source cannot show the loaded page.
+        assert 'не подтверждена' in await monitor.resume()
+        assert not await monitor.poll_once()
+        assert db.source_states('test')[0]['state']==SourceState.WAITING_FOR_USER
+        assert len(source.calls)==1
     asyncio.run(scenario())
 
 

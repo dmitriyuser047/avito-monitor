@@ -61,7 +61,10 @@ class Config:
     data_dir: Path = field(default=ROOT / "data")
     save_debug_html: bool = False
     debug_html_retention_hours: float = 24
-    cooldown_seconds: float = 900
+    cooldown_seconds: float = 900  # first local backoff after 429 without Retry-After
+    max_backoff_seconds: float = 6 * 3600  # ceiling of the doubling local backoff
+    verification_check_seconds: float = 5  # local DOM reads while a check is pending; no requests
+    watchdog_seconds: float = 600  # a loop without a heartbeat this long restarts the process
     browser_engine: str = 'playwright'
     fetch_mode: str = 'light_fetch'
     browser_channel: str = 'chrome'
@@ -90,6 +93,9 @@ def load_config() -> Config:
         save_debug_html=os.environ.get("SAVE_DEBUG_HTML", "0") == "1",
         debug_html_retention_hours=float(os.environ.get("DEBUG_HTML_RETENTION_HOURS", "24")),
         cooldown_seconds=float(os.environ.get("COOLDOWN_SECONDS", "900")),
+        max_backoff_seconds=float(os.environ.get("MAX_BACKOFF_SECONDS", str(6 * 3600))),
+        verification_check_seconds=float(os.environ.get("VERIFICATION_CHECK_SECONDS", "5")),
+        watchdog_seconds=float(os.environ.get("WATCHDOG_SECONDS", "600")),
         browser_engine=os.environ.get('BROWSER_ENGINE', 'playwright').strip().lower(),
         fetch_mode=os.environ.get('FETCH_MODE', 'light_fetch').strip().lower(),
         browser_channel=os.environ.get('BROWSER_CHANNEL', 'chrome').strip().lower(),
@@ -99,10 +105,13 @@ def load_config() -> Config:
                           ('browser_channel', ('chrome', 'chromium'))):
         if getattr(cfg, name) not in allowed:
             raise ValueError(f'{name} must be one of: {", ".join(allowed)}')
-    for name in ('requests_per_minute', 'night_requests_per_minute', 'cooldown_seconds', 'debug_html_retention_hours'):
+    for name in ('requests_per_minute', 'night_requests_per_minute', 'cooldown_seconds', 'max_backoff_seconds',
+                 'verification_check_seconds', 'watchdog_seconds', 'debug_html_retention_hours'):
         value = getattr(cfg, name)
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f'{name} must be a positive finite number')
+    if cfg.max_backoff_seconds < cfg.cooldown_seconds:
+        raise ValueError('MAX_BACKOFF_SECONDS must not be less than COOLDOWN_SECONDS')
     if any(h < 0 or h > 23 for h in cfg.night_hours):
         raise ValueError('NIGHT_HOURS must contain hours 0–23')
     if cfg.owner_id is not None and cfg.owner_id <= 0:

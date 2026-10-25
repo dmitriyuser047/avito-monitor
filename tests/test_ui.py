@@ -20,10 +20,10 @@ def test_parse_price():
 def test_screens_render():
     s = Subscription(3, "1660 super", 8000, 15000, ["нерабоч", "ti"])
     screens = [
-        ui.main_menu(paused=False, status="работает", last_ok=time.time() - 5, active=1, total=2, found_today=3, city="Казань"),
-        ui.main_menu(paused=True, status="работает", last_ok=None, active=0, total=0, found_today=0, city="Казань"),
+        ui.main_menu(status="работает", last_ok=time.time() - 5, active=1, total=2, found_today=3, city="Казань"),
+        ui.main_menu(status="IDLE: нет активных запросов", last_ok=None, active=0, total=0, found_today=0, city="Казань"),
         ui.sub_list([s]), ui.sub_list([]), ui.sub_card(s, 4), ui.delete_confirm(s),
-        ui.status_screen(status="работает", paused=False, last_ok=None, cycle=3.2, interval="10 ± 3 с",
+        ui.status_screen(status="работает", last_ok=None, cycle=3.2, interval="10 ± 3 с",
                          feeds=["a/b"], seen=1234),
         ui.wiz_category(False), ui.wiz_category(True), ui.wiz_query("gpu", False), ui.wiz_query("", True),
         ui.wiz_price("1660 super", False), ui.wiz_minus("1660 super", ["куплю", "ti"], False),
@@ -100,9 +100,9 @@ def test_members_access(tmp_path: Path):
     assert tg.allowed(2) and tg.recipients() == [1, 2]
     text, kb = ui.access_screen(db.members())
     assert "Вася" in text and any("Убрать" in b.text for row in kb.inline_keyboard for b in row)
-    owner_menu = [b.text for row in ui.main_menu(paused=False, status="работает", last_ok=None, active=0, total=0,
+    owner_menu = [b.text for row in ui.main_menu(status="работает", last_ok=None, active=0, total=0,
                                                    found_today=0, city="Казань", is_owner=True)[1].inline_keyboard for b in row]
-    member_menu = [b.text for row in ui.main_menu(paused=False, status="работает", last_ok=None, active=0, total=0,
+    member_menu = [b.text for row in ui.main_menu(status="работает", last_ok=None, active=0, total=0,
                                                     found_today=0, city="Казань", is_owner=False)[1].inline_keyboard for b in row]
     assert "Доступ" in owner_menu and "Доступ" not in member_menu
 
@@ -143,11 +143,15 @@ def test_caption_dates_across_days(monkeypatch):
     assert ui.when_text(item) == 'появилось в поиске 23.10 в 12:30'
 
 
-def test_browser_closed_stops_monitor(tmp_path: Path):
-    import pytest
+def test_closed_browser_is_restarted_not_stopped(tmp_path: Path):
+    import asyncio
     from types import SimpleNamespace
+    from unittest.mock import AsyncMock
     from avito_bot.config import load_config
-    from avito_bot.monitor import BrowserClosed, Monitor
-    mon = Monitor(load_config(), DB(tmp_path / "c.sqlite3"), SimpleNamespace(closed=True), None, None)
-    with pytest.raises(BrowserClosed):
-        mon._check_browser()
+    from avito_bot.monitor import Monitor
+    alert = AsyncMock()
+    mon = Monitor(load_config(), DB(tmp_path / "c.sqlite3"), SimpleNamespace(closed=True), alert, None)
+    # The first restart waits a short delay; nothing is fetched while the browser is down.
+    assert not asyncio.run(mon._ensure_browser())
+    assert mon.source_down == 'browser_closed' and mon.status.startswith('RESTARTING')
+    assert 'Перезапускаю' in alert.await_args.args[0]

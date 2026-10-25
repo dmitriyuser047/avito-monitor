@@ -190,6 +190,10 @@ class Scraper:
         self.light_ok = False
         self._initial_load = True
         self._closed = False
+        # Main-frame navigations in this browser run; light_fetch never navigates, so a newer
+        # number proves the open document is newer than a restriction answered by fetch().
+        self.navigation_generation = 0
+        self.last_error: str | None = None
         self._sample_written = False
         self.sample_path = profile_dir.parent / 'feed_sample.html' if save_debug_html else None
         legacy = profile_dir.parent / 'feed_sample.html'
@@ -241,6 +245,7 @@ class Scraper:
                      self.browser_engine, self.browser_channel, self.fetch_mode)
             self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
             self.ctx.on('close', lambda *_: setattr(self, '_closed', True))
+            self.page.on('framenavigated', self._on_navigated)
             self.page.on('close', lambda *_: setattr(self, '_closed', True))
             await self._start_network_metrics()
             await self.set_window('minimized')
@@ -249,6 +254,22 @@ class Scraper:
                       self.browser_engine, self.browser_channel)
             await self.stop()
             raise
+
+    def _on_navigated(self, frame) -> None:
+        if getattr(frame, 'parent_frame', None) is None:
+            self.navigation_generation += 1
+
+    async def check(self, search) -> FetchResult:
+        return await self.fetch(search.url)
+
+    async def health(self):
+        from .sources import SourceHealth
+        return SourceHealth(started=self.ctx is not None, closed=self.closed,
+                            detail=dict(engine=self.browser_engine, channel=self.browser_channel,
+                                        mode=self.fetch_mode, run_id=self.run_id, last_error=self.last_error))
+
+    async def close(self) -> None:
+        await self.stop()
 
     async def _start_network_metrics(self) -> None:
         session = None
@@ -389,7 +410,8 @@ class Scraper:
                            retry_after: str | None = None) -> FetchResult:
         url = url or (self.page.url if self.page else '')
         try:
-            raw = await self.page.evaluate(f'({INSPECT_FN})(document)')
+            # Reads the document already in the page; never a network request.
+            raw = await asyncio.wait_for(self.page.evaluate(f'({INSPECT_FN})(document)'), 15)
             raw.update(status=code, retry_after=retry_after)
             result = parse_result(raw, self.source_id, _city(url))
             if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
@@ -401,6 +423,7 @@ class Scraper:
 
     def _error(self, url: str, exc: Exception, code: int | None = None) -> FetchResult:
         log.warning('Source request failed: %s', type(exc).__name__)
+        self.last_error = type(exc).__name__
         return FetchResult(FetchStatus.NETWORK_ERROR, [], self.source_id, _city(url), time.time(),
                            http_status=code,
                            diagnostics={'error': type(exc).__name__})

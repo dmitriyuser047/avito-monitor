@@ -106,7 +106,7 @@ class TelegramBot:
         subs = self.db.subscriptions()
         mon = self.monitor
         return ui.main_menu(
-            paused=mon.paused, status=mon.status, last_ok=mon.last_ok,
+            status=mon.status, last_ok=mon.last_ok,
             active=sum(s.enabled for s in subs), total=len(subs),
             found_today=self.db.found_today(), city=self._city_name(), is_owner=uid == self.owner_id,
         )
@@ -135,7 +135,7 @@ class TelegramBot:
         interval = (f"{mon.budget():g} загрузок в минуту, каждый город — раз в ~{mon.city_period():.0f} с\n"
                     f"Ночью ({cfg.night_hours[0]}:00–{cfg.night_hours[1]}:00) — {cfg.night_requests_per_minute:g} в минуту")
         return ui.status_screen(
-            status=mon.status, paused=mon.paused, last_ok=mon.last_ok, cycle=mon.last_cycle_sec,
+            status=mon.status, last_ok=mon.last_ok, cycle=mon.last_cycle_sec,
             interval=interval, feeds=[ui.city_name(c) for c in cities], seen=self.db.seen_count(),
         )
 
@@ -275,18 +275,11 @@ class TelegramBot:
             except Exception as exc:
                 log.warning("Test notification failed: %s", type(exc).__name__)
 
-        @r.message(Command("pause"))
-        async def cmd_pause(m: Message):
-            self.monitor.set_paused(True)
-            await self._show(m, self._menu(m.from_user.id))
-
-        @r.message(Command("resume"), is_owner)
-        async def cmd_resume(m: Message):
-            try:
-                await m.answer(await self.monitor.resume())
-            except Exception:
-                await m.answer("Браузер недоступен. Проверьте /health и перезапустите бот на компьютере.")
-            await self._show(m, self._menu(m.from_user.id))
+        @r.message(Command("pause", "resume"))
+        async def cmd_removed_pause(m: Message):
+            # 2.0 has no user pause: the bot resumes by itself when the source allows it.
+            await m.answer("Паузы и /resume больше нет: бот сам продолжает сбор, когда Авито это разрешает, "
+                           "и сам замечает пройденную проверку в окне Chrome. Подробности — /health.")
 
         @r.message(Command("add"))
         async def cmd_add(m: Message, command: CommandObject, state: FSMContext):
@@ -315,19 +308,6 @@ class TelegramBot:
                 await self._show(c, self._status())
             elif to == "test":
                 await self._send_test(c.from_user.id)
-            elif to in ("pause", "resume"):
-                if to == "resume" and c.from_user.id != self.owner_id:
-                    await c.answer("Возобновить опрос может владелец", show_alert=True)
-                    return
-                if to == "resume":
-                    try:
-                        text = await self.monitor.resume()
-                    except Exception:
-                        text = "Браузер недоступен. Проверьте /health и перезапустите бот на компьютере."
-                    await self.bot.send_message(c.from_user.id, text)
-                else:
-                    self.monitor.set_paused(True)
-                await self._show(c, self._menu(c.from_user.id))
             else:
                 await state.clear()
                 await self._show(c, self._menu(c.from_user.id))

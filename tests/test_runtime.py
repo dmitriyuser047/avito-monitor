@@ -216,7 +216,7 @@ def test_source_startup_failure_keeps_telegram_and_worker_independent_and_closes
     monkeypatch.setattr(avito_bot,'DeliveryWorker',FakeWorker)
     async def run_monitor(self):
         await asyncio.sleep(.01)
-        assert self._source_stopped and 'STOPPED' in self.status
+        assert self.source_down and 'RESTARTING' in self.status  # retried automatically, not a stop
         assert 'telegram started' in events and 'delivery started' in events
     monkeypatch.setattr(avito_bot.Monitor,'run',run_monitor)
     with caplog.at_level('INFO',logger='avito_bot'):

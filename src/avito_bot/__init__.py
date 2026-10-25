@@ -15,7 +15,6 @@ from .monitor import Monitor
 from .photo_cache import PhotoCache
 from .runtime import InstanceLock, raise_open_files_limit
 from .scraper import Scraper
-from .sources import SourceState
 
 log = logging.getLogger('avito_bot')
 
@@ -42,8 +41,17 @@ async def run() -> None:
                           cfg.browser_engine, cfg.fetch_mode, cfg.browser_channel)
         async def console_alert(text):
             log.info('[alert] %s', text)
+        async def start_source():
+            # Used at startup and by every automatic browser restart; starting makes no request to Avito.
+            nonlocal proxy
+            if cfg.direct_interface and proxy is None:
+                candidate = DirectProxy(cfg.direct_interface)
+                await candidate.start()
+                proxy = candidate
+                scraper.proxy_url = proxy.url
+            await scraper.start()
         monitor = Monitor(cfg, db, scraper, tg.alert if tg else console_alert,
-                          recipients=tg.recipients if tg else None)
+                          recipients=tg.recipients if tg else None, start_source=start_source)
         if tg:
             tg.monitor = monitor
             # Reuse each listing image for multiple recipients without extra
@@ -60,17 +68,14 @@ async def run() -> None:
             await tg.setup()
             tasks.append(asyncio.create_task(tg.dp.start_polling(tg.bot, handle_signals=False), name='telegram'))
         try:
-            if cfg.direct_interface:
-                proxy = DirectProxy(cfg.direct_interface)
-                await proxy.start()
-                scraper.proxy_url = proxy.url
-            await scraper.start()
-            db.save_source_state(scraper.source_id, '*', SourceState.ACTIVE)
+            await start_source()
         except Exception as exc:
-            log.error('Source startup failed: %s. Telegram remains available.', type(exc).__name__)
-            monitor._source_stopped = True
-            monitor.status = 'STOPPED: не удалось запустить браузер/прокси'
-            db.save_source_state(scraper.source_id, '*', SourceState.STOPPED, reason=type(exc).__name__)
+            # A browser/proxy failure is not a restriction of Avito; the monitor retries it with backoff.
+            log.error('Source startup failed: %s. Telegram remains available; restart is automatic.',
+                      type(exc).__name__)
+            db.record_event('source_failed', source_id=scraper.source_id, result='startup_failed',
+                            error=type(exc).__name__)
+            monitor.source_failed(f'startup: {type(exc).__name__}')
         tasks.append(asyncio.create_task(monitor.run(), name='source'))
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

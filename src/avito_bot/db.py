@@ -136,6 +136,17 @@ class DB:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_one_running_study
                 ON studies(source_id) WHERE status='running';
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY,
+                at REAL NOT NULL,
+                kind TEXT NOT NULL,
+                correlation_id TEXT,
+                source_id TEXT,
+                city TEXT,
+                result TEXT,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_kind_at ON events(kind, at);
             CREATE TABLE IF NOT EXISTS study_samples (
                 study_id INTEGER NOT NULL,
                 sampled_at REAL NOT NULL,
@@ -160,6 +171,18 @@ class DB:
         for name, declaration in SOURCE_STATE_COLUMNS.items():
             if name not in state_columns:
                 self.conn.execute(f'ALTER TABLE source_state ADD COLUMN {name} {declaration}')
+        # 2.0 state model: terms, codes and set times are kept; the user's pause and the
+        # "wait for /resume" state are not carried over.
+        from .sources import legacy_state  # sources imports matcher, which imports this module
+        for source_id, city, state, reason in list(self.conn.execute(
+                'SELECT source_id,city,state,reason FROM source_state')):
+            mapped = legacy_state(state, reason)
+            if mapped is None:
+                self.conn.execute('DELETE FROM source_state WHERE source_id=? AND city=?', (source_id, city))
+            elif mapped != state:
+                self.conn.execute('UPDATE source_state SET state=? WHERE source_id=? AND city=?',
+                                  (mapped, source_id, city))
+        self.conn.execute("DELETE FROM settings WHERE key='paused'")
         self.conn.commit()
 
     # --- подписки ---
@@ -316,6 +339,20 @@ class DB:
                               (source_id, city, state, next_allowed_at, reason, now, since,
                                http_status, server_until))
         return not old or old[0] != state
+
+    def record_event(self, kind: str, *, correlation_id: str | None = None, source_id: str | None = None,
+                     city: str | None = None, result: str | None = None, at: float | None = None,
+                     **details) -> None:
+        """Diagnostic event; callers pass only safe fields (no cookies, tokens, chats or page text)."""
+        with self.conn:
+            self.conn.execute('INSERT INTO events(at,kind,correlation_id,source_id,city,result,details_json)'
+                              ' VALUES (?,?,?,?,?,?,?)',
+                              (time.time() if at is None else at, kind, correlation_id, source_id, city, result,
+                               json.dumps(details, ensure_ascii=False, sort_keys=True)))
+
+    def prune_events(self, older_than_days: int = 30) -> None:
+        with self.conn:
+            self.conn.execute('DELETE FROM events WHERE at < ?', (time.time() - older_than_days * 86400,))
 
     def latest_snapshot(self, source_id: str, city: str) -> tuple[set[int], float] | None:
         row = self.conn.execute("SELECT item_ids_json,fetched_at FROM fetch_metrics"

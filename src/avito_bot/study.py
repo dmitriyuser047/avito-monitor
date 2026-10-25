@@ -36,19 +36,18 @@ def begin_study(db: DB, cfg, hours: float = 24, now: float | None = None) -> int
 
 
 def snapshot_state(monitor, now):
-    if monitor._source_stopped or monitor.scraper.closed:
-        return 'STOPPED'
-    if monitor.paused:
-        return 'PAUSED'
+    if monitor.source_down or monitor.scraper.closed:
+        return 'RESTARTING'
     if not monitor.db.subscriptions(only_enabled=True):
         return 'IDLE'
     states = monitor.db.source_states(monitor.source_id)
-    if any(s['state']=='WAITING_FOR_USER' for s in states):
-        return 'WAITING_FOR_USER'
-    for state in ('COOLDOWN','DEGRADED'):
+    for state in ('VERIFICATION_REQUIRED', 'ACCESS_DENIED'):
+        if any(s['state']==state for s in states):
+            return state
+    for state in ('RATE_LIMITED', 'PARSER_ERROR', 'NETWORK_UNAVAILABLE', 'RECOVERING'):
         if any(s['state']==state and (s['next_allowed_at'] or 0)>now for s in states):
             return state
-    return 'ACTIVE'
+    return 'AVAILABLE'
 
 
 class StudyRecorder:

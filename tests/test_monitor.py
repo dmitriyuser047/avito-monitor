@@ -48,7 +48,7 @@ def test_restrictions_stop_all_cities_and_survive_restart(env,status):
         # The restart reports the saved restriction once and never as a new answer from Avito.
         assert len(source.calls)==1 and alert.await_count==2
         assert alert.await_args.args[0].startswith('Сохранённое ограничение с прошлого запуска')
-        assert 'старая сохранённая блокировка' in alert.await_args.args[0]
+        assert 'сохранено с прошлого запуска' in alert.await_args.args[0]
         assert not await restarted.poll_once() and alert.await_count==2
         assert db.source_states('test')[0]['next_allowed_at']>time.time()+3500
     asyncio.run(scenario())
@@ -59,7 +59,6 @@ def test_cooldown_retries_only_after_allowed_time(env):
         cfg,db=env;source=FakeSource(FetchStatus.RATE_LIMITED,retry=900)
         monitor=Monitor(cfg,db,source,AsyncMock())
         await monitor.poll_once()
-        monitor.set_paused(False)
         assert not await monitor.poll_once()
         with db.conn:
             db.conn.execute('UPDATE source_state SET next_allowed_at=0')
@@ -70,33 +69,38 @@ def test_cooldown_retries_only_after_allowed_time(env):
     asyncio.run(scenario())
 
 
-def test_manual_resume_is_required_after_block(env):
+def test_block_is_never_lifted_by_blind_requests(env):
     async def scenario():
         cfg,db=env;source=FakeSource(FetchStatus.BLOCKED)
         monitor=Monitor(cfg,db,source,AsyncMock())
         await monitor.poll_once()
         db.set('next_poll:test','0')
         source.status=FetchStatus.NO_RESULTS
-        assert not await monitor.poll_once()
-        # /resume never lifts an unconfirmed block; this source cannot show the loaded page.
-        assert 'не подтверждена' in await monitor.resume()
-        assert not await monitor.poll_once()
-        assert db.source_states('test')[0]['state']==SourceState.WAITING_FOR_USER
+        # This source cannot show a loaded page, so nothing can confirm access: no requests at all.
+        for _ in range(5):
+            assert not await monitor.poll_once()
+        assert db.source_states('test')[0]['state']==SourceState.ACCESS_DENIED
         assert len(source.calls)==1
     asyncio.run(scenario())
 
 
-def test_pause_checks_closed_browser_and_does_not_restart(env):
+def test_closed_browser_is_restarted_without_requests_or_lost_restrictions(env):
     async def scenario():
-        cfg,db=env;source=FakeSource();alert=AsyncMock()
-        monitor=Monitor(cfg,db,source,alert)
-        monitor.set_paused(True)
-        assert not await monitor.poll_once()
+        cfg,db=env;source=FakeSource(FetchStatus.RATE_LIMITED,retry=3600);alert=AsyncMock()
+        started=[]
+        async def start_source():
+            started.append(1); source.closed=False
+        monitor=Monitor(cfg,db,source,alert,start_source=start_source)
+        source.stop=AsyncMock()
+        assert await monitor.poll_once()
         source.closed=True
         assert not await monitor.poll_once()
-        assert 'STOPPED' in monitor.status
-        assert not await monitor.poll_once()
-        assert source.calls==[] and alert.await_count==1
+        assert 'RESTARTING' in monitor.status and monitor.source_down=='browser_closed'
+        monitor._restart_at=0
+        assert not await monitor.poll_once()  # restarted, but the saved 429 term still binds
+        assert started==[1] and monitor.source_down is None
+        assert db.source_states('test')[0]['state']==SourceState.RATE_LIMITED
+        assert len(source.calls)==1
     asyncio.run(scenario())
 
 
@@ -134,7 +138,7 @@ def listing(item_id):
                 'только что',None,'','',feed='tovary_dlya_kompyutera',city='kazan',published=time.time())
 
 
-def test_monitor_queues_and_sender_runs_when_source_paused(env):
+def test_monitor_queues_and_sender_runs_when_source_stopped(env):
     async def scenario():
         cfg,db=env; source=FakeSource(FetchStatus.OK,[listing(10)])
         monitor=Monitor(cfg,db,source,AsyncMock(),recipients=lambda:[1,2])
@@ -147,8 +151,9 @@ def test_monitor_queues_and_sender_runs_when_source_paused(env):
         await monitor.poll_once()
         assert db.queue_counts()=={'pending':2}
         assert db.found_today()==0
-        monitor.set_paused(True)
-        assert not await monitor.poll_once()
+        source.status=FetchStatus.BLOCKED
+        db.set('next_poll:test','0')
+        assert await monitor.poll_once() and not await monitor.poll_once()  # the source stops; delivery does not
         send=AsyncMock();worker=DeliveryWorker(db,send,lambda _:True)
         await worker.deliver_once();await worker.deliver_once()
         assert db.queue_counts()=={'sent':2}
@@ -178,9 +183,10 @@ def test_parse_changed_diagnostics_and_backoff(env):
         cfg,db=env; source=FakeSource(FetchStatus.PARSE_CHANGED)
         monitor=Monitor(cfg,db,source,AsyncMock())
         await monitor.poll_once()
-        assert db.source_states('test')[0]['state']==SourceState.DEGRADED
+        assert db.source_states('test')[0]['state']==SourceState.PARSER_ERROR
         db.set('next_poll:test','0')
         assert not await monitor.poll_once()
         health=monitor.health_text()
-        assert 'parse_changed' in health and 'DEGRADED' in health and 'Очередь' in health
+        assert 'parse_changed' in health and 'PARSER_ERROR' in health and 'очередь' in health
+        assert 'Сервис: RUNNING' in health and 'затем автоматическая проверка' in health
     asyncio.run(scenario())

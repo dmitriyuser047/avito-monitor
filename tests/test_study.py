@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -40,9 +41,10 @@ def test_passive_recording_never_requests_and_survives_restart(setup):
     mon.study.tick(mon,now=100)
     mon.study.tick(mon,now=101)
     assert db.conn.execute('SELECT count(*) FROM study_samples').fetchone()[0]==1
-    mon.set_paused(True)
+    db.save_source_state('local_browser','kazan',SourceState.VERIFICATION_REQUIRED,None,'challenge')
     StudyRecorder(db,cfg.data_dir).tick(mon,now=102)
-    assert db.conn.execute('SELECT state FROM study_samples ORDER BY sampled_at').fetchall()==[('ACTIVE',),('PAUSED',)]
+    assert db.conn.execute('SELECT state FROM study_samples ORDER BY sampled_at').fetchall()==[
+        ('AVAILABLE',),('VERIFICATION_REQUIRED',)]
     assert mon.scraper.calls==0
     assert make_report(db.conn,study_id,now=103)['status']=='running'
     with pytest.raises(ValueError,match='already running'):
@@ -54,7 +56,7 @@ def test_long_shutdown_is_unobserved_not_active_time(setup):
     study_id=begin_study(db,cfg,hours=1,now=100)
     mon.study.tick(mon,now=100)
     report=make_report(db.conn,study_id,now=3700)
-    assert report['sampled_state_seconds']['ACTIVE']==120
+    assert report['sampled_state_seconds']['AVAILABLE']==120
     assert report['sampled_state_seconds']['UNOBSERVED']==3480
     assert report['observer_coverage']<.04
     assert any('без наблюдателя' in s for s in report['warnings'])
@@ -88,24 +90,27 @@ def test_changed_filters_are_visible(setup):
     assert any('изменились фильтры' in s for s in report['warnings'])
 
 
-def test_restrictions_have_no_hidden_requests_and_stop_after_second_429(setup):
+def test_repeated_429_backs_off_and_resumes_without_commands(setup):
     async def scenario():
         cfg,db,mon=setup
         begin_study(db,cfg,now=100)
         await mon.poll_once()
         assert mon.scraper.calls==1
-        assert db.source_states('local_browser')[0]['state']==SourceState.COOLDOWN
+        first=db.source_states('local_browser')[0]
+        assert first['state']==SourceState.RATE_LIMITED and first['server_until'] is None
         with db.conn:db.conn.execute('UPDATE source_state SET next_allowed_at=0')
         db.set('next_poll:local_browser','0')
         await mon.poll_once()
         assert mon.scraper.calls==2
-        assert db.source_states('local_browser')[0]['state']==SourceState.WAITING_FOR_USER
-        with db.conn:db.conn.execute('UPDATE source_state SET next_allowed_at=0')
+        second=db.source_states('local_browser')[0]
+        # A second 429 doubles the local backoff instead of waiting for /resume forever.
+        assert second['state']==SourceState.RATE_LIMITED and second['reason']=='repeated HTTP 429'
+        assert second['next_allowed_at']>=time.time()+2*cfg.cooldown_seconds-5
         db.set('next_poll:local_browser','0')
         restarted=Monitor(cfg,db,mon.scraper,AsyncMock())
         for _ in range(3):assert not await restarted.poll_once()
         assert mon.scraper.calls==2
-        restarted.set_paused(False)
+        with db.conn:db.conn.execute('UPDATE source_state SET next_allowed_at=0')
         assert await restarted.poll_once()
         assert mon.scraper.calls==3
     asyncio.run(scenario())
@@ -118,7 +123,8 @@ def test_existing_cooldown_migration_counts_prior_429(setup):
                         http_status=429,raw_count=0,matched_count=0,overlap_count=None,interval_sec=None,
                         cooldown_until=0,item_ids_json='[]')
         await mon.poll_once()
-        assert db.source_states('local_browser')[0]['state']==SourceState.WAITING_FOR_USER
+        state=db.source_states('local_browser')[0]
+        assert state['state']==SourceState.RATE_LIMITED and state['reason']=='repeated HTTP 429'
         assert db.get('rate_limit_streak:local_browser')=='2'
     asyncio.run(scenario())
 
@@ -128,7 +134,7 @@ def test_study_failure_cannot_stop_the_source(setup,monkeypatch):
         cfg,db,mon=setup
         monkeypatch.setattr(mon.study,'tick',lambda *args:(_ for _ in ()).throw(OSError('disk full')))
         assert await mon.poll_once()
-        assert mon.scraper.calls==1 and not mon._source_stopped
+        assert mon.scraper.calls==1 and not mon.source_down
     asyncio.run(scenario())
 
 
@@ -193,17 +199,17 @@ def test_empty_baseline_does_not_hide_next_real_new_items(setup):
     asyncio.run(scenario())
 
 
-def test_pause_and_cooldown_are_measured_without_resuming(setup):
+def test_restrictions_are_measured_without_resuming(setup):
     cfg,db,mon=setup
     study_id=begin_study(db,cfg,now=100)
-    db.save_source_state('local_browser','kazan',SourceState.COOLDOWN,1000,'HTTP 429')
+    db.save_source_state('local_browser','kazan',SourceState.RATE_LIMITED,1000,'HTTP 429')
     mon.study.tick(mon,now=100)
     mon.study.tick(mon,now=160)
-    mon.set_paused(True)
+    db.save_source_state('local_browser','kazan',SourceState.VERIFICATION_REQUIRED,None,'challenge')
     mon.study.tick(mon,now=170)
     report=make_report(db.conn,study_id,now=200)
-    assert report['sampled_state_seconds']['COOLDOWN']==70
-    assert report['sampled_state_seconds']['PAUSED']==30
+    assert report['sampled_state_seconds']['RATE_LIMITED']==70
+    assert report['sampled_state_seconds']['VERIFICATION_REQUIRED']==30
     assert mon.scraper.calls==0
     assert 'Наблюдение №' in mon.health_text()
 
@@ -217,17 +223,24 @@ def test_report_export_failure_is_retryable_and_never_marks_complete(setup,monke
     assert db.conn.execute('SELECT status FROM studies WHERE id=?',(study_id,)).fetchone()[0]=='running'
 
 
-def test_redeploy_promotes_old_repeated_cooldown_without_extra_request(setup):
+def test_legacy_waiting_for_resume_migrates_to_timed_restriction(setup):
     async def scenario():
         cfg,db,mon=setup
-        for stamp in (1,2):
-            db.record_fetch(source_id='local_browser',city='kazan',fetched_at=stamp,status='rate_limited',
-                            http_status=429,raw_count=0,matched_count=0,overlap_count=None,interval_sec=None,
-                            cooldown_until=0,item_ids_json='[]')
-        db.save_source_state('local_browser','kazan',SourceState.COOLDOWN,0,'HTTP 429')
-        restarted=Monitor(cfg,db,mon.scraper,AsyncMock())
+        future=time.time()+600
+        with db.conn:
+            db.conn.execute("INSERT OR REPLACE INTO source_state(source_id,city,state,next_allowed_at,reason,updated_at)"
+                            " VALUES ('local_browser','kazan','WAITING_FOR_USER',?,'repeated HTTP 429',1)",(future,))
+            db.conn.execute("INSERT OR REPLACE INTO settings VALUES ('paused','1')")
+        migrated=DB(cfg.data_dir/'x.sqlite3')
+        state=migrated.source_states('local_browser')[0]
+        # The saved term and its origin stay; the wait for /resume and the user pause do not.
+        assert state['state']==SourceState.RATE_LIMITED and state['next_allowed_at']==future
+        assert state['since']==1 and migrated.get('paused') is None
+        restarted=Monitor(cfg,migrated,mon.scraper,AsyncMock())
         assert not await restarted.poll_once()
-        assert mon.scraper.calls==0
-        assert db.source_states('local_browser')[0]['state']==SourceState.WAITING_FOR_USER
-        assert restarted.alert.await_count==1
+        assert mon.scraper.calls==0 and restarted.alert.await_count==1
+        with migrated.conn:migrated.conn.execute('UPDATE source_state SET next_allowed_at=0')
+        assert await restarted.poll_once()
+        assert mon.scraper.calls==1
+        migrated.close()
     asyncio.run(scenario())

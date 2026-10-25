@@ -108,13 +108,10 @@ def test_switch_and_restart_do_not_reset_restrictions_or_budget(tmp_path, mode, 
         db = DB(path)
         restarted = Monitor(cfg2, db, source2, AsyncMock())
         assert not await restarted.poll_once()
-        restarted.set_paused(False)
-        if code != 429:
-            # Resume explicitly clears indefinite waiting; don't do it before asserting persistence.
-            assert db.get('next_poll:local_browser') == budget
-        else:
-            assert db.source_states('local_browser')[0]['next_allowed_at'] == until
-            assert 'ещё не истекла' in await restarted.open_verification()
+        assert db.get('next_poll:local_browser') == budget
+        assert db.source_states('local_browser')[0]['next_allowed_at'] == until
+        if code == 429:
+            assert 'ещё не истёк' in await restarted.open_verification()
             assert not await restarted.poll_once()
         source2.page.goto.assert_not_awaited()
         source2.page.evaluate.assert_not_awaited()
@@ -131,19 +128,17 @@ def test_manual_verification_and_resume_share_restrictions_and_metrics(tmp_path,
         db.add_subscription('3060',None,None,[],'gpu',['kazan'])
         mon = Monitor(cfg,db,source,AsyncMock())
         await mon.poll_once()
-        assert db.source_states(source.source_id)[0]['state'] == SourceState.WAITING_FOR_USER
+        assert db.source_states(source.source_id)[0]['state'] == SourceState.VERIFICATION_REQUIRED
         # A server-provided Retry-After remains binding even for a manual captcha check.
         with db.conn:
             db.conn.execute('UPDATE source_state SET next_allowed_at=0')
-        before = source.page.evaluate.await_count
-        assert not await mon.poll_once()
-        assert source.page.evaluate.await_count == before
+        before = source.page.goto.await_count
+        assert not await mon.poll_once()  # at most a local DOM read, never a navigation
+        assert source.page.goto.await_count == before
         raw.update(challenge=False, catalog=True, empty=True)
         assert 'обычная выдача подтверждена' in await mon.open_verification()
-        assert not mon.paused  # an Avito restriction is not the user's pause
         assert db.conn.execute("SELECT operation FROM fetch_metrics ORDER BY id DESC LIMIT 1").fetchone()[0] == 'manual'
-        assert db.source_states(source.source_id)[0]['state'] == SourceState.ACTIVE
-        mon.set_paused(False)
+        assert db.source_states(source.source_id)[0]['state'] == SourceState.AVAILABLE
         db.set('next_poll:local_browser','0')
         assert await mon.poll_once()
         report = comparison_report(db.conn)
@@ -172,7 +167,7 @@ def test_additive_metrics_migration_preserves_legacy_rows_and_states(tmp_path):
         db = DB(path)
         row = db.conn.execute('SELECT id,http_status,cooldown_until,browser_engine,fetch_mode,request_count FROM fetch_metrics').fetchone()
         assert row == (3,429,999,None,None,None)
-        assert db.source_states('local_browser')[0]['state'] == 'WAITING_FOR_USER'
+        assert db.source_states('local_browser')[0]['state'] == 'RATE_LIMITED'  # 2.0 migration keeps the term
         report = comparison_report(db.conn)
         assert report['unattributed_checks'] == 1 and len(report['groups']) == 4
         assert all(g['configuration_totals']['success_share'] is None and g['configuration_totals']['checks']==0 for g in report['groups'])

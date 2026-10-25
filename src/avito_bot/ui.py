@@ -43,7 +43,7 @@ PRICE_PRESETS = [
 
 
 class Nav(CallbackData, prefix="nav"):
-    to: str  # menu, list, status, add, pause, resume, test
+    to: str  # menu, list, status, add, test
 
 
 class SubCb(CallbackData, prefix="sub"):
@@ -182,9 +182,9 @@ def short_sub(s: Subscription) -> str:
 
 # --- экраны ---
 
-def main_menu(*, paused: bool, status: str, last_ok: float | None, active: int, total: int,
+def main_menu(*, status: str, last_ok: float | None, active: int, total: int,
               found_today: int, city: str, is_owner: bool = True) -> tuple[str, InlineKeyboardMarkup]:
-    state = "на паузе" if paused else status
+    state = html.escape(status)
     text = (
         "<b>Авито-монитор</b>\n"
         f"{html.escape(city)} · комплектующие и ПК\n\n"
@@ -196,10 +196,6 @@ def main_menu(*, paused: bool, status: str, last_ok: float | None, active: int, 
     kb = InlineKeyboardBuilder()
     kb.row(_btn("Добавить запрос", Nav(to="add"), "primary"))
     kb.row(_btn("Мои запросы", Nav(to="list")), _btn("Состояние", Nav(to="status")))
-    if paused:
-        kb.row(_btn("Продолжить слежение", Nav(to="resume"), "success"))
-    else:
-        kb.row(_btn("Поставить на паузу", Nav(to="pause")))
     if is_owner:
         kb.row(_btn("Доступ", Nav(to="access")))
     return text, kb.as_markup()
@@ -308,12 +304,12 @@ def delete_confirm(s: Subscription) -> tuple[str, InlineKeyboardMarkup]:
     return text, kb.as_markup()
 
 
-def status_screen(*, status: str, paused: bool, last_ok: float | None, cycle: float | None,
+def status_screen(*, status: str, last_ok: float | None, cycle: float | None,
                   interval: str, feeds: list[str], seen: int) -> tuple[str, InlineKeyboardMarkup]:
     feeds_text = ", ".join(html.escape(f) for f in feeds)
     text = (
         "<b>Состояние</b>\n\n"
-        f"Слежение: <b>{'на паузе' if paused else status}</b>\n"
+        f"Слежение: <b>{html.escape(status)}</b>\n"
         f"Последняя успешная проверка: {ago(last_ok)}\n"
         f"Длительность цикла: {f'{cycle:.1f} с' if cycle else '—'}\n"
         f"Интервал опроса: {interval}\n"

@@ -325,9 +325,18 @@ class Scraper:
                 return self._measured(result, measurement, 'page_navigation')
             result = await self.read_current(url, code, headers.get('retry-after'))
             if result.status is FetchStatus.PARSE_CHANGED and code not in (403, 429, 439):
-                # Wait for client rendering, without navigation or fetch retries.
+                # Await a meaningful page state without issuing a second HTTP request.
+                # An empty catalog or security challenge must not be treated as a
+                # selector timeout; read_current will classify the result.
                 try:
-                    await self.page.wait_for_selector('[data-marker="catalog-serp"]', timeout=5000)
+                    await self.page.wait_for_function(
+                        """() => !!document.querySelector(
+                          '[data-marker="catalog-serp"],'
+                          + '[data-marker="search-results/empty"],'
+                          + '[data-marker="catalog-serp/empty"],'
+                          + '[data-marker="captcha"],iframe[src*="hcaptcha"],iframe[src*="geetest"]'
+                        ) || /доступ ограничен|проверка безопасности|ничего не найдено/i.test(document.title)""",
+                        timeout=5000)
                 except Exception:
                     pass
                 result = await self.read_current(url, code, headers.get('retry-after'))

@@ -44,6 +44,7 @@ STATE_TEXT = {
 # Browser restarts: bounded delays, never a loop that hammers the source (start makes no request).
 RESTART_DELAYS = (5, 30, 60, 300, 600)
 FAILED_AFTER = 5
+SCHEDULER_RETRY_BASE = 5  # seconds; doubles up to 10 minutes
 
 
 def backoff(base: float, ceiling: float, level: int) -> float:
@@ -214,7 +215,7 @@ class Monitor:
             except Exception as exc:
                 # Never a permanent stop: back off, keep Telegram running and try again.
                 self._loop_errors += 1
-                delay = min(600, 5 * 2 ** min(self._loop_errors - 1, 7))
+                delay = min(600, SCHEDULER_RETRY_BASE * 2 ** min(self._loop_errors - 1, 7))
                 log.exception('Scheduler failure #%s; retry in %ss, Telegram remains available',
                               self._loop_errors, delay)
                 self.status = f'RECOVERING: ошибка планировщика ({type(exc).__name__}), повтор через {delay} с'
@@ -227,7 +228,10 @@ class Monitor:
                                          'Сбор пытается восстановиться сам; Telegram работает. Проверьте /health.')
                     except Exception:
                         log.exception('Cannot send scheduler alert')
-                await asyncio.sleep(delay)
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    self.heartbeat = time.monotonic()  # waiting on purpose is not a hang
+                    await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
                 continue
             if self._loop_errors:
                 self._loop_errors = 0

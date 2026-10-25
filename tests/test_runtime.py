@@ -18,7 +18,10 @@ def test_restart_limit_and_terminal_exit_codes():
         assert restart_delay(code,[],100) is None
     assert restart_delay(1,[],100) == 10
     assert restart_delay(1,[90,95],100) == 60
-    assert restart_delay(1,[90,91,92,93,94],100) is None
+    # Repeated crashes slow down to 10 minutes but never stop the service for good.
+    assert restart_delay(1,[90,91,92,93,94],100) == 600
+    assert restart_delay(1,list(range(50)),100) == 600
+    assert restart_delay(75,[],100) == 10  # watchdog exit
     assert restart_delay(1,[1,2,3,4,5],2000) == 10
 
 

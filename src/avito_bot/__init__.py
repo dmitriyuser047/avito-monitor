@@ -15,6 +15,7 @@ from .monitor import Monitor
 from .photo_cache import PhotoCache
 from .runtime import InstanceLock, raise_open_files_limit
 from .scraper import Scraper
+from .watchdog import ComponentHung, HUNG_EXIT_CODE, Watchdog
 
 log = logging.getLogger('avito_bot')
 
@@ -26,6 +27,8 @@ async def run() -> None:
     tasks = []
     try:
         db.prune_seen()
+        db.prune_events()
+        db.record_event('service_started', result=str(os.getpid()))
         if cfg.bot_token:
             try:
                 tg = TelegramBot(cfg.bot_token, db, cfg.owner_id, cfg.city)
@@ -64,7 +67,9 @@ async def run() -> None:
                     return None
                 return await photo_cache.get(url)
             tg.fetch_image = optional_photo
-            tasks.append(asyncio.create_task(DeliveryWorker(db, tg.send_to_chat, tg.allowed).run(), name='delivery'))
+            worker = DeliveryWorker(db, tg.send_to_chat, tg.allowed)
+            monitor.delivery = worker
+            tasks.append(asyncio.create_task(worker.run(), name='delivery'))
             await tg.setup()
             tasks.append(asyncio.create_task(tg.dp.start_polling(tg.bot, handle_signals=False), name='telegram'))
         try:
@@ -77,6 +82,10 @@ async def run() -> None:
                             error=type(exc).__name__)
             monitor.source_failed(f'startup: {type(exc).__name__}')
         tasks.append(asyncio.create_task(monitor.run(), name='source'))
+        beats = {'source': lambda: monitor.heartbeat}
+        if monitor.delivery is not None and hasattr(monitor.delivery, 'heartbeat'):
+            beats['delivery'] = lambda: monitor.delivery.heartbeat
+        tasks.append(asyncio.create_task(Watchdog(cfg.watchdog_seconds, beats).run(), name='watchdog'))
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         registered = []
@@ -112,6 +121,10 @@ async def run() -> None:
         results = await asyncio.gather(*cleanup, return_exceptions=True)
         if any(isinstance(result, BaseException) for result in results):
             log.warning('A resource reported an error during shutdown')
+        try:
+            db.record_event('service_stopped', result=str(os.getpid()))
+        except Exception:
+            log.warning('Cannot record shutdown event')
         db.close()
 
 
@@ -136,5 +149,8 @@ def main() -> None:
     except BlockingIOError:
         log.error('Another instance is already running; refusing duplicate Telegram polling')
         raise SystemExit(78)
+    except ComponentHung as exc:
+        log.error('%s; exiting so the supervisor starts a fresh process', exc)
+        raise SystemExit(HUNG_EXIT_CODE)
     except KeyboardInterrupt:
         pass

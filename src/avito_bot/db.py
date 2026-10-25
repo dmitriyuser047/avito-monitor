@@ -17,6 +17,8 @@ FETCH_DIAGNOSTIC_COLUMNS = {
     'operation': "TEXT NOT NULL DEFAULT 'automatic'",
     'is_warmup': 'INTEGER', 'restriction_reason': 'TEXT',
 }
+# Origin of a restriction: when it was first set, the HTTP answer and the server-given term.
+SOURCE_STATE_COLUMNS = {'since': 'REAL', 'http_status': 'INTEGER', 'server_until': 'REAL'}
 
 
 @dataclass
@@ -154,6 +156,10 @@ class DB:
         for name, declaration in FETCH_DIAGNOSTIC_COLUMNS.items():
             if name not in metrics_columns:
                 self.conn.execute(f'ALTER TABLE fetch_metrics ADD COLUMN {name} {declaration}')
+        state_columns = {r[1] for r in self.conn.execute('PRAGMA table_info(source_state)')}
+        for name, declaration in SOURCE_STATE_COLUMNS.items():
+            if name not in state_columns:
+                self.conn.execute(f'ALTER TABLE source_state ADD COLUMN {name} {declaration}')
         self.conn.commit()
 
     # --- подписки ---
@@ -288,18 +294,27 @@ class DB:
         return dict(self.conn.execute("SELECT status,COUNT(*) FROM notification_outbox GROUP BY status"))
 
     def source_states(self, source_id: str) -> list[dict]:
-        cur = self.conn.execute("SELECT city,state,next_allowed_at,reason,updated_at FROM source_state"
+        cur = self.conn.execute("SELECT city,state,next_allowed_at,reason,updated_at,"
+                                "COALESCE(since,updated_at) AS since,http_status,server_until FROM source_state"
                                 " WHERE source_id=? ORDER BY city", (source_id,))
         names = [c[0] for c in cur.description]
         return [dict(zip(names, row)) for row in cur]
 
     def save_source_state(self, source_id: str, city: str, state: str,
-                          next_allowed_at: float | None = None, reason: str = '') -> bool:
-        old = self.conn.execute("SELECT state FROM source_state WHERE source_id=? AND city=?",
-                                (source_id, city)).fetchone()
+                          next_allowed_at: float | None = None, reason: str = '',
+                          http_status: int | None = None, server_until: float | None = None,
+                          since: float | None = None) -> bool:
+        old = self.conn.execute("SELECT state,COALESCE(since,updated_at) FROM source_state"
+                                " WHERE source_id=? AND city=?", (source_id, city)).fetchone()
+        now = time.time()
+        # Repeating the same state keeps the moment the restriction was first set.
+        if since is None:
+            since = old[1] if old and old[0] == state else now
         with self.conn:
-            self.conn.execute("INSERT OR REPLACE INTO source_state VALUES (?,?,?,?,?,?)",
-                              (source_id, city, state, next_allowed_at, reason, time.time()))
+            self.conn.execute("INSERT OR REPLACE INTO source_state (source_id,city,state,next_allowed_at,reason,"
+                              "updated_at,since,http_status,server_until) VALUES (?,?,?,?,?,?,?,?,?)",
+                              (source_id, city, state, next_allowed_at, reason, now, since,
+                               http_status, server_until))
         return not old or old[0] != state
 
     def latest_snapshot(self, source_id: str, city: str) -> tuple[set[int], float] | None:

@@ -3,7 +3,6 @@ import asyncio
 import logging
 import os
 import signal
-import time
 from logging.handlers import RotatingFileHandler
 from aiogram.utils.token import TokenValidationError
 
@@ -48,11 +47,8 @@ async def run() -> None:
             tg.monitor = monitor
             # Delivery does not need a live browser; photo is optional.
             async def optional_photo(url):
-                if monitor.paused or monitor._source_stopped or any(
-                    s['state'] == SourceState.WAITING_FOR_USER or
-                    (s['next_allowed_at'] or 0) > time.time()
-                    for s in db.source_states(scraper.source_id)
-                ):
+                # No photo request before the first confirmed catalog of this run (e.g. a fresh profile).
+                if not monitor.photos_allowed():
                     return None
                 return await scraper.download(url)
             tg.fetch_image = optional_photo

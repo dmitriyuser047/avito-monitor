@@ -6,6 +6,7 @@ import time
 from .config import load_config
 from .db import DB
 from .direct_proxy import DirectProxy
+from .monitor import rate_limit_terms
 from .runtime import InstanceLock
 from .scraper import Scraper
 from .sources import FetchStatus, SourceState
@@ -17,6 +18,10 @@ async def run() -> None:
     proxy, scraper = None, None
     try:
         states = db.source_states('local_browser')
+        for s in states:
+            if s['state'] != SourceState.ACTIVE and s['city'] != '*':
+                print(f"Сохранённое состояние {s['city']}: {s['state']} ({s['reason']}), "
+                      f"HTTP {s['http_status'] or '—'}, установлено {time.strftime('%d.%m %H:%M', time.localtime(s['since']))}")
         if any((s['next_allowed_at'] or 0) > time.time() for s in states):
             print('Пауза источника ещё не истекла. Новых обращений не выполнялось.')
             return
@@ -38,8 +43,9 @@ async def run() -> None:
                 print('Доступ подтверждён. Можно запускать бота; если была пауза — /resume.')
                 return
             if result.status is FetchStatus.RATE_LIMITED:
-                db.save_source_state('local_browser', waiting, SourceState.COOLDOWN,
-                                     time.time() + max(cfg.cooldown_seconds, result.retry_after_sec or 0), 'HTTP 429')
+                server_until, until = rate_limit_terms(time.time(), result.retry_after_sec, cfg.cooldown_seconds, 1)
+                db.save_source_state('local_browser', waiting, SourceState.COOLDOWN, until, 'HTTP 429',
+                                     result.http_status, server_until)
                 print('Авито указал паузу. Проверка остановлена.')
                 return
             if scraper.closed:

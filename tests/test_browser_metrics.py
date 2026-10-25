@@ -139,8 +139,8 @@ def test_manual_verification_and_resume_share_restrictions_and_metrics(tmp_path,
         assert not await mon.poll_once()
         assert source.page.evaluate.await_count == before
         raw.update(challenge=False, catalog=True, empty=True)
-        assert 'Страница открыта' in await mon.open_verification()
-        assert mon.paused
+        assert 'обычная выдача подтверждена' in await mon.open_verification()
+        assert not mon.paused  # an Avito restriction is not the user's pause
         assert db.conn.execute("SELECT operation FROM fetch_metrics ORDER BY id DESC LIMIT 1").fetchone()[0] == 'manual'
         assert db.source_states(source.source_id)[0]['state'] == SourceState.ACTIVE
         mon.set_paused(False)

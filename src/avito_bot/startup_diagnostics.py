@@ -55,6 +55,7 @@ class StartupDiagnostics:
         self.events.append(dict(at=time.time(), kind='request', domain=domain(event.get('request', {}).get('url', '')),
                                 type=event.get('type', 'unknown'), phase=phase,
                                 redirect_status=event.get('redirectResponse', {}).get('status'),
+                                redirect_domain=domain(event.get('redirectResponse', {}).get('url', '')),
                                 route=self.summary['route']))
 
     def response(self, event: dict) -> None:

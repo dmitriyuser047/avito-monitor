@@ -49,11 +49,19 @@ async def run() -> None:
         async def start_source():
             # Used at startup and by every automatic browser restart; starting makes no request to Avito.
             nonlocal proxy
+            if proxy and not proxy.health()['connected']:
+                await proxy.stop()
+                proxy = None
             if cfg.browser_session_mode == 'managed' and cfg.direct_interface and proxy is None:
                 candidate = DirectProxy(cfg.direct_interface)
-                await candidate.start()
+                try:
+                    await candidate.start()
+                except BaseException:
+                    await candidate.stop()
+                    raise
                 proxy = candidate
                 scraper.proxy_url = proxy.url
+                scraper.proxy_health = proxy.health
             await scraper.start()
         monitor = Monitor(cfg, db, scraper, tg.alert if tg else console_alert,
                           recipients=tg.recipients if tg else None, start_source=start_source)

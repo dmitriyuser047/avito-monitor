@@ -107,6 +107,8 @@ class Monitor:
         self._restart_attempts = 0
         self._loop_errors = 0
         self._restored = [s for s in db.source_states(self.source_id) if self._restricting(s, self.started_at)]
+        if hasattr(scraper, 'diagnostics'):
+            scraper.diagnostics.update(previous_restriction_restored=bool(self._restored))
         for s in self._restored:
             log.info('Restored restriction city=%s state=%s reason=%s http=%s since=%s until=%s',
                      s['city'], s['state'], s['reason'], self._http_status(s), s['since'], s['next_allowed_at'])
@@ -300,6 +302,9 @@ class Monitor:
             self.status = 'AVAILABLE: ожидает следующей проверки'
 
     async def _poll_once(self) -> bool:
+        if hasattr(self.scraper, 'diagnostics'):
+            self.scraper.diagnostics.update(connection='disconnected'
+                if self.source_down or self.scraper.closed else 'connected')
         if self._restored:
             restored, self._restored = self._restored, []
             await self.alert(self._restored_text(restored))
@@ -363,13 +368,21 @@ class Monitor:
         self.status = f'RESTARTING: браузер перезапускается ({reason})'
 
     async def _ensure_browser(self) -> bool:
+        if (self.source_down is None and hasattr(self.scraper, 'proxy_health')
+                and not self.scraper.proxy_health()['connected']):
+            self.source_failed('proxy_disconnected')
+            self._event('source_failed', result='proxy_disconnected')
         if self.source_down is None:
             if not getattr(self.scraper, 'closed', False):
                 return True
-            self.source_failed('browser_closed')
-            self._event('source_failed', result='browser_closed')
-            await self.alert('Браузер бота закрылся\nПерезапускаю его автоматически. Telegram и очередь работают, '
-                             'сохранённые ограничения Авито не сбрасываются.')
+            attached = getattr(self.scraper, 'session_mode', None) == 'cdp_attach'
+            reason = 'cdp_disconnected' if attached else 'browser_closed'
+            self.source_failed(reason)
+            self._event('source_failed', result=reason)
+            await self.alert(('Потеряно подключение к Chrome (CDP)\nПовторяю подключение автоматически. '
+                              'Запустите отдельный Chrome с прежним профилем и портом. '
+                              if attached else 'Браузер бота закрылся\nПерезапускаю его автоматически. ')
+                             + 'Telegram и очередь работают; сохранённые ограничения Авито не сбрасываются.')
         if time.monotonic() < self._restart_at:
             return False
         try:
@@ -527,7 +540,7 @@ class Monitor:
             await notify(text + 'Очередь Telegram работает.')
         elif status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
             state = SourceState.VERIFICATION_REQUIRED if status is FetchStatus.CHALLENGE else SourceState.ACCESS_DENIED
-            server_until = until = time.time() + result.retry_after_sec if result.retry_after_sec else None
+            server_until = until = time.time() + result.retry_after_sec if result.retry_after_sec is not None else None
             changed = self.access.record(result, state, until,
                                                 status.value, result.http_status, server_until)
             saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
@@ -556,7 +569,7 @@ class Monitor:
             state = SourceState.NETWORK_UNAVAILABLE
             if status is FetchStatus.PARSE_CHANGED:
                 delay, state = max(900, delay), SourceState.PARSER_ERROR
-            server_until = time.time() + result.retry_after_sec if result.retry_after_sec else None
+            server_until = time.time() + result.retry_after_sec if result.retry_after_sec is not None else None
             until = max(time.time() + delay, server_until or 0)
             changed = self.access.record(result, state, until, status.value,
                                                 result.http_status, server_until)
@@ -773,7 +786,12 @@ class Monitor:
                             if getattr(getattr(getattr(self.scraper, 'session_manager', None), 'session', None),
                                        'last_error', None) else '')
                          + (f'; перезапуск: {html.escape(self.source_down)}' if self.source_down else ''))
+        if getattr(self.scraper, 'session_mode', None) == 'cdp_attach':
+            lines.append('CDP: маршрут пользовательского Chrome неизвестен; DirectProxy бота не применяется')
         for s in states:
+            facts = self.access.get(s['city'])
+            lines.append(f"{s['city']}: проверка требуется={facts.verification_required}, "
+                         f"подтверждена={facts.verification_confirmed}; серверный срок={_when(s.get('server_until'))}")
             if self._restricting(s, now):
                 lines.append(html.escape(f"{s['city']}: {self.restriction_label(s)} ({s['state']}, {s['reason']})"))
                 lines.extend(html.escape('  ' + line) for line in self.restriction_details(s, now))

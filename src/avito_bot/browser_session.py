@@ -2,6 +2,9 @@
 import asyncio
 import importlib
 import json
+import os
+import shutil
+import sys
 import uuid
 from pathlib import Path
 from typing import Protocol
@@ -29,6 +32,35 @@ def validate_profile(profile: Path) -> Path:
     if any(profile == p.resolve() or p.resolve() in profile.parents for p in defaults):
         raise ValueError('CDP requires a separate non-default Chrome user data directory')
     return profile
+
+
+async def verify_local_listener(port: int) -> None:
+    """Validate the actual local listener, including wildcard bindings, before CDP discovery."""
+    executable = shutil.which('lsof')
+    if executable:
+        proc = await asyncio.create_subprocess_exec(executable, '-nP', f'-iTCP:{port}',
+            '-sTCP:LISTEN', '-Fn', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), 5)
+        except BaseException:
+            proc.kill()
+            await proc.wait()
+            raise
+        addresses = [line[1:].rsplit(':', 1)[0] for line in stdout.decode().splitlines() if line.startswith('n')]
+        if not addresses or any(address not in ('127.0.0.1', '[::1]') for address in addresses):
+            raise ValueError('CDP listener must bind only to loopback, never wildcard/LAN')
+    elif sys.platform.startswith('linux'):
+        addresses = []
+        for file in ('/proc/net/tcp', '/proc/net/tcp6'):
+            for line in Path(file).read_text().splitlines()[1:]:
+                parts = line.split()
+                address, local_port = parts[1].split(':')
+                if int(local_port, 16) == port and parts[3] == '0A':
+                    addresses.append(address)
+        if not addresses or any(a not in ('0100007F', '00000000000000000000000001000000') for a in addresses):
+            raise ValueError('CDP listener must bind only to loopback')
+    else:
+        raise RuntimeError('Cannot verify local CDP listener; install lsof')
 
 
 class BrowserSession(Protocol):
@@ -72,15 +104,29 @@ class ManagedBrowserSession:
         try:
             self.user_data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.user_data_dir.chmod(0o700)
+            singleton = self.user_data_dir / 'SingletonLock'
+            if singleton.is_symlink():
+                try:
+                    pid = int(os.readlink(singleton).rsplit('-', 1)[1])
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    pass  # Chrome itself handles its stale singleton, without deleting the profile.
+                except (ValueError, PermissionError):
+                    raise RuntimeError('Cannot verify ownership of the existing Chrome profile') from None
+                else:
+                    raise RuntimeError('Chrome profile is already in use')
             # Managed profiles must not reopen saved URLs before the scheduler allows a check.
             prefs = self.user_data_dir / 'Default' / 'Preferences'
             if prefs.exists():
                 data = json.loads(prefs.read_text())
                 data.setdefault('session', {}).update(restore_on_startup=5, startup_urls=[])
-                prefs.write_text(json.dumps(data))
+                temporary = prefs.with_suffix('.monitor-tmp')
+                temporary.write_text(json.dumps(data))
+                temporary.chmod(0o600)
+                temporary.replace(prefs)
             self.pw = await api.async_playwright().start()
             self.ctx = await self.pw.chromium.launch_persistent_context(
-                str(self.user_data_dir), channel=self.channel, headless=self.headless,
+                str(self.user_data_dir), channel=self.channel, headless=self.headless, timeout=30000,
                 proxy={'server': self.proxy_url} if self.proxy_url else None,
                 locale='ru-RU', timezone_id='Europe/Moscow', no_viewport=True,
                 args=['--window-size=1400,900', '--no-first-run', '--disable-session-crashed-bubble'])
@@ -109,7 +155,7 @@ class ManagedBrowserSession:
         try:
             try:
                 if self.ctx:
-                    await self.ctx.close()
+                    await asyncio.wait_for(self.ctx.close(), 10)
             finally:
                 if self.pw:
                     await self.pw.stop()
@@ -141,6 +187,7 @@ class AttachedChromeSession(ManagedBrowserSession):
                 raise ValueError('cdp_attach requires explicit BROWSER_ENGINE=playwright')
             endpoint = validate_endpoint(self.endpoint)
             profile = validate_profile(self.profile_dir)
+            await verify_local_listener(urlsplit(endpoint).port)
             # Local discovery only; do not follow redirects or environment proxies.
             async with httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=5) as client:
                 response = await client.get(endpoint + '/json/version')
@@ -173,6 +220,8 @@ class AttachedChromeSession(ManagedBrowserSession):
             if target_file.exists():
                 saved_target = target_file.read_text().strip()
             for page in self.ctx.pages:
+                if page.is_closed():
+                    continue
                 probe = await self.ctx.new_cdp_session(page)
                 try:
                     target = (await probe.send('Target.getTargetInfo'))['targetInfo']['targetId']

@@ -99,7 +99,9 @@ LIGHT_JS = f"""async ([url, wantHtml]) => {{
   const r = await fetch(url, {{credentials: 'include', cache: 'no-store',
     signal: AbortSignal.timeout(25000), headers: {{'accept': 'text/html,application/xhtml+xml'}}}});
   const meta = {{status: r.status, url: r.url, retry_after: r.headers.get('retry-after')}};
-  const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+  let doc;
+  try {{ doc = new DOMParser().parseFromString(await r.text(), 'text/html'); }}
+  catch (_) {{ return {{...meta, items: []}}; }}
   const out = ({INSPECT_FN})(doc);
   // Debug output deliberately excludes scripts, form values, cookies and full HTML.
   return {{...out, ...meta,
@@ -456,6 +458,9 @@ class Scraper:
             raw.update(status=code, retry_after=retry_after)
             result = parse_result(raw, self.source_id, _city(url))
             result.diagnostics['document_started_at'] = raw.get('document_started_at')
+            self.diagnostics.update(browser_page=('catalog' if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS)
+                else 'challenge' if result.status == FetchStatus.CHALLENGE
+                else 'blocked' if result.status == FetchStatus.BLOCKED else 'unknown'))
             if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
                 self.light_ok = True
                 self._final_url[url] = self.page.url

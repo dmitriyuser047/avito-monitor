@@ -12,6 +12,7 @@ from .db import DB
 from .delivery import DeliveryWorker
 from .direct_proxy import DirectProxy
 from .monitor import Monitor
+from .photo_cache import PhotoCache
 from .runtime import InstanceLock
 from .scraper import Scraper
 from .sources import SourceState
@@ -45,12 +46,15 @@ async def run() -> None:
                           recipients=tg.recipients if tg else None)
         if tg:
             tg.monitor = monitor
+            # Reuse each listing image for multiple recipients without extra
+            # requests. Respect the source safety gate on every recipient.
+            photo_cache = PhotoCache(scraper.download)
             # Delivery does not need a live browser; photo is optional.
             async def optional_photo(url):
                 # No photo request before the first confirmed catalog of this run (e.g. a fresh profile).
                 if not monitor.photos_allowed():
                     return None
-                return await scraper.download(url)
+                return await photo_cache.get(url)
             tg.fetch_image = optional_photo
             tasks.append(asyncio.create_task(DeliveryWorker(db, tg.send_to_chat, tg.allowed).run(), name='delivery'))
             await tg.setup()

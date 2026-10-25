@@ -1,4 +1,7 @@
-"""Confirms a passed check from the page already open in the browser; never makes a request.
+"""Confirms access from the page already open in the browser; never makes a request.
+
+Any stop without a server-given term (a check, a block, the bot's own pause after 429 or an error)
+ends as soon as the open Avito page shows a normal catalog: the source is plainly available.
 
 The open document is trusted only when it is newer than the restriction: either it is the
 restriction page itself (answered by a navigation), or the main frame navigated afterwards.
@@ -9,7 +12,7 @@ import logging
 import time
 from urllib.parse import urlparse
 
-from .sources import FetchStatus, IP_CHECK_REASON, SourceState, USER_STATES
+from .sources import FetchStatus, IP_CHECK_REASON, TIMED_STATES, USER_STATES
 
 log = logging.getLogger(__name__)
 
@@ -34,10 +37,19 @@ class VerificationCoordinator:
         return dom_shows or self._generation() > generation
 
     def pending(self) -> list[dict]:
-        return [s for s in self.monitor.db.source_states(self.monitor.source_id)
-                if (s['state'] in USER_STATES
-                    or (s['state'] == SourceState.RATE_LIMITED and s['reason'] == IP_CHECK_REASON))
-                and (s['city'], s['since']) not in self._confirmed]
+        now = time.time()
+        pending = []
+        for s in self.monitor.db.source_states(self.monitor.source_id):
+            if (s['city'], s['since']) in self._confirmed:
+                continue
+            if s['state'] in USER_STATES:
+                pending.append(s)
+            # The bot's own pause can end early; a Retry-After from Avito cannot. A passed IP check is
+            # still acknowledged under Retry-After, and collection then starts when the term ends.
+            elif (s['state'] in TIMED_STATES and (s['next_allowed_at'] or 0) > now
+                  and (not (s.get('server_until') or 0) > now or s['reason'] == IP_CHECK_REASON)):
+                pending.append(s)
+        return pending
 
     def describe(self) -> str:
         if not self.pending():

@@ -110,8 +110,9 @@ def test_switch_and_restart_do_not_reset_restrictions_or_budget(tmp_path, mode, 
         assert not await restarted.poll_once()
         assert db.get('next_poll:local_browser') == budget
         assert db.source_states('local_browser')[0]['next_allowed_at'] == until
-        if code == 429:
-            assert 'ещё не истёк' in await restarted.open_verification()
+        if code == 429 and db.source_states('local_browser')[0]['server_until']:
+            # Avito's Retry-After: even the owner's /unblock waits for it.
+            assert 'Авито указал срок' in await restarted.open_verification()
             assert not await restarted.poll_once()
         source2.page.goto.assert_not_awaited()
         source2.page.evaluate.assert_not_awaited()
@@ -131,7 +132,7 @@ def test_manual_verification_and_resume_share_restrictions_and_metrics(tmp_path,
         assert db.source_states(source.source_id)[0]['state'] == SourceState.VERIFICATION_REQUIRED
         # A server-provided Retry-After remains binding even for a manual captcha check.
         with db.conn:
-            db.conn.execute('UPDATE source_state SET next_allowed_at=0')
+            db.conn.execute('UPDATE source_state SET next_allowed_at=0, server_until=0')
         before = source.page.goto.await_count
         assert not await mon.poll_once()  # at most a local DOM read, never a navigation
         assert source.page.goto.await_count == before

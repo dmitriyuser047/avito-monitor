@@ -43,6 +43,8 @@ STATE_TEXT = {
     SourceState.NETWORK_UNAVAILABLE: 'сеть или сервер недоступны',
     SourceState.RECOVERING: 'восстановление',
 }
+EARLY_RESUME = ('Продолжить раньше: отправьте /unblock — бот один раз загрузит страницу в окне Chrome; '
+                'если там проверка, пройдите её. Как только в окне видна обычная выдача, сбор идёт сразу.')
 # Browser restarts: bounded delays, never a loop that hammers the source (start makes no request).
 RESTART_DELAYS = (5, 30, 60, 300, 600)
 FAILED_AFTER = 5
@@ -164,6 +166,8 @@ class Monitor:
             if state['reason'] == IP_CHECK_REASON and not (server and server > now):
                 wait += ('. Быстрее: нажмите «Продолжить» в окне Chrome бота и пройдите проверку — '
                          'сбор продолжится сразу')
+            elif not (server and server > now):
+                wait += '. Раньше: /unblock или обычная выдача Авито в окне Chrome бота'
         else:
             wait = 'срок истёк, ближайшая проверка по расписанию'
         return [f"Причина: {REASON_TEXT.get(state['reason'], state['reason'] or '—')}",
@@ -267,6 +271,8 @@ class Monitor:
                  'При запуске новых запросов к Авито не было: это состояние из базы, а не ответ '
                  + (f'текущего браузера {engine}.' if engine else 'текущего запуска.')
                  + ' Сбор продолжится сам, когда это будет разрешено.']
+        if any(not (s.get('server_until') or 0) > time.time() for s in states):
+            lines.append(EARLY_RESUME)
         for s in states:
             lines.append(f"\n{s['city']}: {self.restriction_label(s)}")
             lines.extend(self.restriction_details(s))
@@ -487,11 +493,11 @@ class Monitor:
             reason = IP_CHECK_REASON if passable else ('HTTP 429' if level == 1 else 'repeated HTTP 429')
             self.db.save_source_state(self.source_id, city, SourceState.RATE_LIMITED, until, reason,
                                       result.http_status, server_until)
-            if passable:
-                saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
-                self.verification.note_restriction(city, saved['since'], True)
-                if hasattr(self.scraper, 'set_window'):
-                    await self.scraper.set_window('normal')
+            saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
+            # A navigated 429 leaves its own page on screen; after fetch() the page is older than the answer.
+            self.verification.note_restriction(city, saved['since'], diagnostics['actual_mode'] == 'page_navigation')
+            if passable and hasattr(self.scraper, 'set_window'):
+                await self.scraper.set_window('normal')
             self.status = f'{SourceState.RATE_LIMITED}: новый HTTP 429'
             self._event('source_rate_limited', correlation_id=correlation_id, city=city, result='http_429',
                         http_status=result.http_status, retry_after_sec=result.retry_after_sec,
@@ -507,6 +513,8 @@ class Monitor:
                 text += ('\nНа странице «Доступ ограничен: проблема с IP» Авито предлагает проверку. Окно Chrome '
                          'бота открыто: нажмите «Продолжить» и пройдите её — бот сам увидит обычную выдачу'
                          + (' и продолжит сбор сразу. ' if not server_until else ', а сбор начнётся после срока Авито. '))
+            elif not server_until:
+                text += EARLY_RESUME + ' '
             await self.alert(text + 'Очередь Telegram работает.')
         elif status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
             state = SourceState.VERIFICATION_REQUIRED if status is FetchStatus.CHALLENGE else SourceState.ACCESS_DENIED
@@ -543,6 +551,8 @@ class Monitor:
             until = max(time.time() + delay, server_until or 0)
             changed = self.db.save_source_state(self.source_id, city, state, until, status.value,
                                                 result.http_status, server_until)
+            saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
+            self.verification.note_restriction(city, saved['since'], False)  # an error page proves nothing
             self.status = f'{state}: {STATE_TEXT[state]}'
             if changed:
                 await self.alert('Источник временно недоступен\n'
@@ -692,28 +702,35 @@ class Monitor:
                 self.refresh_status()
 
     async def _open_verification(self) -> str:
+        """One page load on the owner's request: allowed during the bot's own pause, never during
+        a term named by Avito (Retry-After)."""
         if self.source_down or self.scraper.closed:
             return 'Браузер перезапускается. Проверьте /health через минуту.'
+        now = time.time()
         states = self.db.source_states(self.source_id)
-        if any((s['next_allowed_at'] or 0) > time.time() for s in states):
-            return 'Срок ограничения ещё не истёк, страница не открывается. Подробности в /health.'
-        waiting = [s for s in states if s['state'] in USER_STATES]
+        server = max(((s.get('server_until') or 0) for s in states), default=0)
+        if server > now:
+            return f'Авито указал срок ограничения до {_when(server)}; до него страница не открывается.'
+        waiting = [s for s in states if self._restricting(s, now)]
         if not waiting:
-            return 'Проверка не требуется. Подробности в /health.'
+            return 'Ограничений нет, сбор идёт по расписанию. Подробности в /health.'
         if not hasattr(self.scraper, 'load'):
             return 'Этот источник не поддерживает проверку в браузере.'
         await self.scraper.set_window('normal')
         city = waiting[0]['city']
         result = await self.scraper.load(feed_url(city, self.cfg.feed))
-        self.db.set(f'next_poll:{self.source_id}', str(time.time() + self.delay()))
+        self.db.set(f'next_poll:{self.source_id}', str(time.time() + self.next_delay()))
         await self._handle(result, feed_url(city, self.cfg.feed), operation='manual')
         if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
-            # No term is active here (checked above); a confirmed catalog ends every pending check.
+            # No server term is active (checked above); a normal catalog ends every stop.
             for state in waiting:
                 self.db.save_source_state(self.source_id, state['city'], SourceState.AVAILABLE)
             self._wake.set()
             return 'Страница открыта, обычная выдача подтверждена. Сбор продолжается.'
         if result.status is FetchStatus.RATE_LIMITED:
+            if result.diagnostics.get('verification_page'):
+                return ('Авито показал «Доступ ограничен: проблема с IP». Нажмите «Продолжить» в окне Chrome бота '
+                        'и пройдите проверку — сбор продолжится сам.')
             return 'Авито ответил HTTP 429. Сбор продолжится сам после паузы, подробности в /health.'
         return ('Страница проверки открыта в окне Chrome бота. Пройдите проверку — сбор продолжится сам, '
                 'команды отправлять не нужно.')

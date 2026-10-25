@@ -484,18 +484,69 @@ def test_429_ip_check_keeps_retry_after_after_passing(tmp_path):
     asyncio.run(scenario())
 
 
-def test_plain_429_page_is_not_offered_as_a_check(tmp_path):
+def test_bot_pause_ends_as_soon_as_the_window_shows_a_catalog(tmp_path):
     async def scenario():
         db = database(tmp_path)
         scraper = source(tmp_path, dict(items=[]), mode='page_navigation', code=429)
+        alert = AsyncMock()
+        mon = Monitor(config(tmp_path, mode='page_navigation'), db, scraper, alert)
+        assert await mon.poll_once()
+        assert state(db)['reason'] == 'HTTP 429' and state(db)['next_allowed_at'] > time.time() + 800
+        assert '/unblock' in alert.await_args.args[0]
+        scraper.page.evaluate.return_value = catalog(100)  # Avito is available again in the window
+        assert not await mon.poll_once()
+        assert state(db)['state'] == SourceState.AVAILABLE  # the bot's own pause does not keep it waiting
+        assert scraper.page.goto.await_count == 1
+        db.close()
+    asyncio.run(scenario())
+
+
+def test_server_term_is_never_cut_short_by_the_window(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        scraper = source(tmp_path, dict(items=[]), mode='page_navigation', code=429, headers={'retry-after': '3600'})
         mon = Monitor(config(tmp_path, mode='page_navigation'), db, scraper, AsyncMock())
         assert await mon.poll_once()
-        assert state(db)['reason'] == 'HTTP 429'
         scraper.page.evaluate.return_value = catalog(100)
         reads = scraper.page.evaluate.await_count
         for _ in range(3):
             assert not await mon.poll_once()
         assert scraper.page.evaluate.await_count == reads and state(db)['state'] == SourceState.RATE_LIMITED
+        assert 'Авито указал срок' in await mon.open_verification()
+        assert scraper.page.goto.await_count == 1
+        db.close()
+    asyncio.run(scenario())
+
+
+def test_restored_bot_pause_resumes_after_unblock_or_own_navigation(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        old = source(tmp_path, dict(items=[]), mode='page_navigation', code=429)
+        await Monitor(config(tmp_path, mode='page_navigation'), db, old, AsyncMock()).poll_once()
+        db.close()
+        db = database(tmp_path)  # restart with an empty window
+        scraper = source(tmp_path, catalog(100), url='about:blank')
+        alert = AsyncMock()
+        mon = Monitor(config(tmp_path), db, scraper, alert)
+        assert not await mon.poll_once()
+        assert '/unblock' in alert.await_args.args[0]
+        scraper.page.url = CATALOG  # the owner opened Avito in the bot's window
+        scraper._on_navigated(SimpleNamespace(parent_frame=None))
+        assert not await mon.poll_once()
+        assert state(db)['state'] == SourceState.AVAILABLE and scraper.page.goto.await_count == 0
+        db.close()
+    asyncio.run(scenario())
+
+
+def test_unblock_works_during_the_bots_own_pause(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        scraper = source(tmp_path, dict(items=[]), mode='page_navigation', code=429)
+        mon = Monitor(config(tmp_path, mode='page_navigation'), db, scraper, AsyncMock())
+        assert await mon.poll_once()
+        respond(scraper, catalog(100))
+        assert 'обычная выдача подтверждена' in await mon.open_verification()
+        assert state(db)['state'] == SourceState.AVAILABLE and scraper.page.goto.await_count == 2
         db.close()
     asyncio.run(scenario())
 
@@ -534,5 +585,27 @@ def test_check_interval_has_random_spread(tmp_path, monkeypatch, draw):
         assert await mon.poll_once()
         planned = float(db.get('next_poll:local_browser')) - started
         assert abs(planned - mon.delay() * draw) < 2
+        db.close()
+    asyncio.run(scenario())
+
+
+def test_stale_page_after_fetch_429_does_not_end_the_pause(tmp_path):
+    async def scenario():
+        db = database(tmp_path)
+        scraper = source(tmp_path, catalog(100))
+        mon = Monitor(config(tmp_path), db, scraper, AsyncMock())
+        assert await mon.poll_once()  # warm-up navigation: the window shows a normal catalog
+        scraper._on_navigated(SimpleNamespace(parent_frame=None))
+        scraper.page.evaluate.side_effect = [dict(status=429, items=[])]  # off-page fetch answer
+        db.set('next_poll:local_browser', '0')
+        assert await mon.poll_once()
+        scraper.page.evaluate.side_effect = None
+        scraper.page.evaluate.return_value = catalog(100)  # the old document is still on screen
+        for _ in range(3):
+            assert not await mon.poll_once()
+        assert state(db)['state'] == SourceState.RATE_LIMITED
+        scraper._on_navigated(SimpleNamespace(parent_frame=None))  # the owner reloads the page
+        assert not await mon.poll_once()
+        assert state(db)['state'] == SourceState.AVAILABLE
         db.close()
     asyncio.run(scenario())

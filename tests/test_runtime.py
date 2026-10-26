@@ -188,7 +188,7 @@ def test_source_startup_failure_keeps_telegram_and_worker_independent_and_closes
     class FakeScraper:
         source_id='local_browser'
         closed=False
-        def __init__(self,*args):pass
+        def __init__(self,*args,**kwargs):pass
         async def start(self):raise OSError('browser unavailable')
         async def stop(self):events.append('browser closed')
         async def download(self,url):return None

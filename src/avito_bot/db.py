@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,8 @@ class Subscription:
 class DB:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._transaction_depth = 0
+        self._savepoint_id = 0
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
@@ -99,6 +102,10 @@ class DB:
                 next_allowed_at REAL,
                 reason TEXT NOT NULL DEFAULT '',
                 updated_at REAL NOT NULL,
+                PRIMARY KEY(source_id, city)
+            );
+            CREATE TABLE IF NOT EXISTS access_status (
+                source_id TEXT NOT NULL, city TEXT NOT NULL, data_json TEXT NOT NULL,
                 PRIMARY KEY(source_id, city)
             );
             CREATE TABLE IF NOT EXISTS fetch_metrics (
@@ -191,7 +198,28 @@ class DB:
                 self.conn.execute('UPDATE source_state SET state=? WHERE source_id=? AND city=?',
                                   (mapped, source_id, city))
         self.conn.execute("DELETE FROM settings WHERE key='paused'")
-        self.conn.commit()
+        self._commit()
+
+    def _commit(self) -> None:
+        if not self._transaction_depth:
+            self.conn.commit()
+
+    @contextmanager
+    def atomic(self):
+        """Nested writes participate in one transaction; inner methods cannot commit it early."""
+        self._savepoint_id += 1
+        name = f'write_{self._savepoint_id}'
+        self.conn.execute(f'SAVEPOINT {name}')
+        self._transaction_depth += 1
+        try:
+            yield
+            self.conn.execute(f'RELEASE SAVEPOINT {name}')
+        except BaseException:
+            self.conn.execute(f'ROLLBACK TO SAVEPOINT {name}')
+            self.conn.execute(f'RELEASE SAVEPOINT {name}')
+            raise
+        finally:
+            self._transaction_depth -= 1
 
     # --- подписки ---
 
@@ -202,7 +230,7 @@ class DB:
             " VALUES (?, ?, ?, ?, ?, ?)",
             (query, min_price, max_price, " ".join(minus_words), category, " ".join(cities or [])),
         )
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
     def update_subscription(self, sub_id: int, **fields) -> None:
@@ -214,11 +242,11 @@ class DB:
             fields["city"] = " ".join(fields.pop("cities"))  # колонка city: города через пробел
         sets = ", ".join(f"{k} = ?" for k in fields)
         self.conn.execute(f"UPDATE subscriptions SET {sets} WHERE id = ?", (*fields.values(), sub_id))
-        self.conn.commit()
+        self._commit()
 
     def delete_subscription(self, sub_id: int) -> bool:
         cur = self.conn.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
-        self.conn.commit()
+        self._commit()
         return cur.rowcount > 0
 
     def subscriptions(self, only_enabled: bool = False) -> list[Subscription]:
@@ -246,21 +274,21 @@ class DB:
     def mark_seen(self, item_ids: list[int]) -> None:
         now = time.time()
         self.conn.executemany("INSERT OR IGNORE INTO seen VALUES (?, ?)", [(i, now) for i in item_ids])
-        self.conn.commit()
+        self._commit()
 
     def seen_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
 
     def prune_seen(self, older_than_days: int = 30) -> None:
         self.conn.execute("DELETE FROM seen WHERE first_seen < ?", (time.time() - older_than_days * 86400,))
-        self.conn.commit()
+        self._commit()
 
     # --- статистика уведомлений ---
 
     def record_notification(self, item_id: int, sub_ids: list[int]) -> None:
         now = time.time()
         self.conn.executemany("INSERT INTO notifications VALUES (?, ?, ?)", [(item_id, s, now) for s in sub_ids])
-        self.conn.commit()
+        self._commit()
 
     def found_today(self) -> int:
         midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -275,7 +303,7 @@ class DB:
     # Событие и задания каждому получателю фиксируются одной транзакцией.
     def stage_items(self, entries: list[tuple[int, dict, list[int]]], now: float) -> list[int]:
         inserted = []
-        with self.conn:
+        with self.atomic():
             for item_id, payload, chat_ids in entries:
                 cur = self.conn.execute("INSERT OR IGNORE INTO seen VALUES (?, ?)", (item_id, now))
                 if not cur.rowcount:
@@ -298,7 +326,7 @@ class DB:
                                  (item_id,)).fetchone()
         if last and last[0] == price:
             return None
-        with self.conn:
+        with self.atomic():
             cur = self.conn.execute('INSERT INTO price_history(item_id,price,seen_at) VALUES (?,?,?)',
                                     (item_id, price, at))
         return cur.lastrowid, last[0] if last else None
@@ -310,7 +338,7 @@ class DB:
     def stage_price_drop(self, history_id: int, payload: dict, chat_ids: list[int], now: float) -> int:
         """One durable job per recipient and price change; the negative id never collides with a listing."""
         encoded = json.dumps(payload, ensure_ascii=False)
-        with self.conn:
+        with self.atomic():
             return sum(self.conn.execute(
                 'INSERT OR IGNORE INTO notification_outbox (item_id, chat_id, payload_json, next_attempt_at)'
                 ' VALUES (?, ?, ?, ?)', (-history_id, chat_id, encoded, now)).rowcount for chat_id in set(chat_ids))
@@ -336,7 +364,7 @@ class DB:
                 for at, kind, city, result, details in cur]
 
     def claim_delivery(self, now: float, lease_seconds: float = 120) -> dict | None:
-        with self.conn:
+        with self.atomic():
             self.conn.execute("UPDATE notification_outbox SET status='retry', lease_until=NULL"
                               " WHERE status='leased' AND lease_until <= ?", (now,))
             row = self.conn.execute(
@@ -349,7 +377,7 @@ class DB:
         return dict(zip(names, values)) if values else None
 
     def ack_delivery(self, job_id: int, now: float) -> None:
-        with self.conn:
+        with self.atomic():
             row = self.conn.execute("SELECT item_id,payload_json FROM notification_outbox"
                                     " WHERE id=? AND status='leased'", (job_id,)).fetchone()
             if not row:
@@ -362,7 +390,7 @@ class DB:
                                   (row[0], sub["id"], now, row[0], sub["id"]))
 
     def fail_delivery(self, job_id: int, error: str, next_at: float, terminal: bool = False) -> None:
-        with self.conn:
+        with self.atomic():
             self.conn.execute("UPDATE notification_outbox SET status=?,last_error=?,next_attempt_at=?,"
                               "lease_until=NULL WHERE id=? AND status='leased'",
                               ('terminal' if terminal else 'retry', error[:300], next_at, job_id))
@@ -387,7 +415,7 @@ class DB:
         # Repeating the same state keeps the moment the restriction was first set.
         if since is None:
             since = old[1] if old and old[0] == state else now
-        with self.conn:
+        with self.atomic():
             self.conn.execute("INSERT OR REPLACE INTO source_state (source_id,city,state,next_allowed_at,reason,"
                               "updated_at,since,http_status,server_until) VALUES (?,?,?,?,?,?,?,?,?)",
                               (source_id, city, state, next_allowed_at, reason, now, since,
@@ -398,14 +426,14 @@ class DB:
                      city: str | None = None, result: str | None = None, at: float | None = None,
                      **details) -> None:
         """Diagnostic event; callers pass only safe fields (no cookies, tokens, chats or page text)."""
-        with self.conn:
+        with self.atomic():
             self.conn.execute('INSERT INTO events(at,kind,correlation_id,source_id,city,result,details_json)'
                               ' VALUES (?,?,?,?,?,?,?)',
                               (time.time() if at is None else at, kind, correlation_id, source_id, city, result,
                                json.dumps(details, ensure_ascii=False, sort_keys=True)))
 
     def prune_events(self, older_than_days: int = 30) -> None:
-        with self.conn:
+        with self.atomic():
             self.conn.execute('DELETE FROM events WHERE at < ?', (time.time() - older_than_days * 86400,))
 
     def latest_snapshot(self, source_id: str, city: str) -> tuple[set[int], float] | None:
@@ -419,7 +447,7 @@ class DB:
             values.setdefault(name, 'automatic' if name == 'operation' else None)
         extra = ','.join(FETCH_DIAGNOSTIC_COLUMNS)
         params = ','.join(':' + name for name in FETCH_DIAGNOSTIC_COLUMNS)
-        with self.conn:
+        with self.atomic():
             self.conn.execute("INSERT INTO fetch_metrics (source_id,city,fetched_at,status,http_status,"
                               f"raw_count,matched_count,overlap_count,interval_sec,cooldown_until,item_ids_json,{extra})"
                               " VALUES (:source_id,:city,:fetched_at,:status,:http_status,:raw_count,"
@@ -454,22 +482,22 @@ class DB:
 
     def add_member(self, user_id: int, name: str) -> None:
         self.conn.execute("INSERT OR REPLACE INTO members VALUES (?, ?, ?)", (user_id, name, time.time()))
-        self.conn.commit()
+        self._commit()
 
     def remove_member(self, user_id: int) -> None:
         self.conn.execute("DELETE FROM members WHERE user_id = ?", (user_id,))
-        self.conn.commit()
+        self._commit()
 
     def create_invite(self, code: str) -> None:
         self.conn.execute("INSERT INTO invites VALUES (?, ?)", (code, time.time()))
-        self.conn.commit()
+        self._commit()
 
     def use_invite(self, code: str, ttl_hours: int = 24) -> bool:
         """Одноразовое приглашение: True, если код действителен (и он тут же гасится)."""
         cur = self.conn.execute("DELETE FROM invites WHERE code = ? AND created_at > ?",
                                 (code, time.time() - ttl_hours * 3600))
         self.conn.execute("DELETE FROM invites WHERE created_at <= ?", (time.time() - ttl_hours * 3600,))
-        self.conn.commit()
+        self._commit()
         return cur.rowcount > 0
 
     # --- настройки ---
@@ -480,7 +508,7 @@ class DB:
 
     def set(self, key: str, value: str) -> None:
         self.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
-        self.conn.commit()
+        self._commit()
 
 
 def _sub(r) -> Subscription:

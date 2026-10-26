@@ -15,8 +15,10 @@ from dataclasses import asdict
 from datetime import datetime
 from urllib.parse import urlparse
 
+from .access_coordinator import AccessCoordinator
 from .config import Config, feed_url
 from .db import DB
+from .listings_collector import same_search
 from .matcher import classify, is_fresh, matches
 from .sources import (FetchResult, FetchStatus, IP_CHECK_REASON, Search, ServiceState, Source, SourceState,
                       TIMED_STATES, USER_STATES)
@@ -58,7 +60,7 @@ def backoff(base: float, ceiling: float, level: int) -> float:
 def rate_limit_terms(now: float, retry_after: float | None, base: float, level: int,
                      ceiling: float = 6 * 3600):
     """Server Retry-After binds as given; the local backoff applies only when the server named no term."""
-    if retry_after:
+    if retry_after is not None:
         return now + retry_after, now + retry_after
     return None, now + backoff(base, ceiling, level)
 
@@ -77,6 +79,7 @@ class Monitor:
                  start_source=None):
         self.cfg, self.db, self.scraper, self.alert = cfg, db, scraper, alert
         self.source_id = getattr(scraper, 'source_id', 'local_browser')
+        self.access = AccessCoordinator(db, self.source_id)
         self.recipients = recipients or (lambda: [])
         self.status = 'запуск'
         previous_ok = db.conn.execute("SELECT MAX(fetched_at) FROM fetch_metrics WHERE source_id=?"
@@ -104,6 +107,8 @@ class Monitor:
         self._restart_attempts = 0
         self._loop_errors = 0
         self._restored = [s for s in db.source_states(self.source_id) if self._restricting(s, self.started_at)]
+        if hasattr(scraper, 'diagnostics'):
+            scraper.diagnostics.update(previous_restriction_restored=bool(self._restored))
         for s in self._restored:
             log.info('Restored restriction city=%s state=%s reason=%s http=%s since=%s until=%s',
                      s['city'], s['state'], s['reason'], self._http_status(s), s['since'], s['next_allowed_at'])
@@ -297,6 +302,9 @@ class Monitor:
             self.status = 'AVAILABLE: ожидает следующей проверки'
 
     async def _poll_once(self) -> bool:
+        if hasattr(self.scraper, 'diagnostics'):
+            self.scraper.diagnostics.update(connection='disconnected'
+                if self.source_down or self.scraper.closed else 'connected')
         if self._restored:
             restored, self._restored = self._restored, []
             await self.alert(self._restored_text(restored))
@@ -360,18 +368,32 @@ class Monitor:
         self.status = f'RESTARTING: браузер перезапускается ({reason})'
 
     async def _ensure_browser(self) -> bool:
+        extension = getattr(self.scraper, 'session_mode', None) == 'chrome_extension'
+        if (extension and self.source_down
+                and self.scraper.session_manager.session.connected):
+            self._restart_at = 0  # Adopt a late connection immediately, without dropping it.
+        if (self.source_down is None and hasattr(self.scraper, 'proxy_health')
+                and not self.scraper.proxy_health()['connected']):
+            self.source_failed('proxy_disconnected')
+            self._event('source_failed', result='proxy_disconnected')
         if self.source_down is None:
             if not getattr(self.scraper, 'closed', False):
                 return True
-            self.source_failed('browser_closed')
-            self._event('source_failed', result='browser_closed')
-            await self.alert('Браузер бота закрылся\nПерезапускаю его автоматически. Telegram и очередь работают, '
-                             'сохранённые ограничения Авито не сбрасываются.')
+            attached = getattr(self.scraper, 'session_mode', None) in ('cdp_attach', 'chrome_extension')
+            extension = getattr(self.scraper, 'session_mode', None) == 'chrome_extension'
+            reason = 'extension_disconnected' if extension else 'cdp_disconnected' if attached else 'browser_closed'
+            self.source_failed(reason)
+            self._event('source_failed', result=reason)
+            await self.alert(('Потеряно подключение к Chrome\nПовторяю подключение автоматически. '
+                              'Проверьте подключение Chrome в /health. '
+                              if attached else 'Браузер бота закрылся\nПерезапускаю его автоматически. ')
+                             + 'Telegram и очередь работают; сохранённые ограничения Авито не сбрасываются.')
         if time.monotonic() < self._restart_at:
             return False
         try:
             try:
-                await self.scraper.stop()
+                if not extension:
+                    await self.scraper.stop()
             except Exception:
                 log.debug('Browser stop before restart failed', exc_info=True)
             await self.start_source()
@@ -402,7 +424,13 @@ class Monitor:
     # ---------- results ----------
 
     async def _handle(self, result: FetchResult, url: str, operation: str = 'automatic',
-                      announce: bool = True) -> None:
+                      announce: bool = True, alerts: list | None = None) -> None:
+        async def notify(text):
+            if alerts is not None:
+                alerts.append(text)
+            else:
+                await self.alert(text)
+
         status, city = result.status, result.city
         correlation_id = uuid.uuid4().hex[:12]
         diagnostic_names = ('browser_engine', 'browser_channel', 'fetch_mode', 'actual_mode', 'run_id',
@@ -438,8 +466,10 @@ class Monitor:
             self.last_ok = result.observed_at
             self._errors[city] = 0
             self.db.set(f'errors:{self.source_id}:{city}', '0')
-            self.db.set(f'rate_limit_streak:{self.source_id}', '0')
-            self.db.save_source_state(self.source_id, city, SourceState.AVAILABLE)
+            if not any(s['city'] != city and self._restricting(s, time.time())
+                       for s in self.db.source_states(self.source_id)):
+                self.db.set(f'rate_limit_streak:{self.source_id}', '0')
+            self.access.record(result, SourceState.AVAILABLE)
             self._event('catalog_received', correlation_id=correlation_id, city=city, result=status.value,
                         raw_count=len(result.items))
             if before and before['state'] not in (SourceState.AVAILABLE, SourceState.CHECKING):
@@ -447,7 +477,7 @@ class Monitor:
                 self._event('source_recovered', correlation_id=correlation_id, city=city,
                             result=before['state'], recovery_sec=round(recovery, 1))
                 if announce:
-                    await self.alert(f'Доступ к Авито восстановлен\nГород: {city}. Сбор продолжается; '
+                    await notify(f'Доступ к Авито восстановлен\nГород: {city}. Сбор продолжается; '
                                      f'ограничение длилось {_left(recovery)}.')
             items = [i for i in result.items if i.feed in self.cfg.sections]
             for item in items:
@@ -455,7 +485,7 @@ class Monitor:
             subs = self.db.subscriptions(only_enabled=True)
             observation_key = f'observation_seed:{self.source_id}:{city}'
             baseline = self.db.get(observation_key) is None
-            with self.db.conn:
+            with self.db.atomic():
                 for item in items:
                     matched_now = is_fresh(item, result.observed_at) and any(
                         city in (s.cities or [self.cfg.city]) and matches(item, s) for s in subs)
@@ -477,7 +507,7 @@ class Monitor:
                 key = f'coverage:{self.source_id}:{city}'
                 if self.db.get(key) != 'gap':
                     self._event('coverage_gap', correlation_id=correlation_id, city=city)
-                    await self.alert(f'Возможны пропуски в выдаче\nГород: {city}. '
+                    await notify(f'Возможны пропуски в выдаче\nГород: {city}. '
                                      'У соседних снимков нет общих объявлений. Дополнительные запросы не выполняются.')
                 self.db.set(key, 'gap')
             elif ids:
@@ -491,7 +521,7 @@ class Monitor:
             passable = (bool(result.diagnostics.get('verification_page'))
                         and diagnostics['actual_mode'] == 'page_navigation')
             reason = IP_CHECK_REASON if passable else ('HTTP 429' if level == 1 else 'repeated HTTP 429')
-            self.db.save_source_state(self.source_id, city, SourceState.RATE_LIMITED, until, reason,
+            self.access.record(result, SourceState.RATE_LIMITED, until, reason,
                                       result.http_status, server_until)
             saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
             # A navigated 429 leaves its own page on screen; after fetch() the page is older than the answer.
@@ -515,11 +545,11 @@ class Monitor:
                          + (' и продолжит сбор сразу. ' if not server_until else ', а сбор начнётся после срока Авито. '))
             elif not server_until:
                 text += EARLY_RESUME + ' '
-            await self.alert(text + 'Очередь Telegram работает.')
+            await notify(text + 'Очередь Telegram работает.')
         elif status in (FetchStatus.BLOCKED, FetchStatus.CHALLENGE):
             state = SourceState.VERIFICATION_REQUIRED if status is FetchStatus.CHALLENGE else SourceState.ACCESS_DENIED
-            server_until = until = time.time() + result.retry_after_sec if result.retry_after_sec else None
-            changed = self.db.save_source_state(self.source_id, city, state, until,
+            server_until = until = time.time() + result.retry_after_sec if result.retry_after_sec is not None else None
+            changed = self.access.record(result, state, until,
                                                 status.value, result.http_status, server_until)
             saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
             # The open document shows the restriction only when it was answered by a navigation.
@@ -536,7 +566,7 @@ class Monitor:
                 where = ('Страница проверки уже открыта в окне Chrome бота.' if shown else
                          'Разверните окно Chrome бота и обновите страницу (или отправьте /unblock), '
                          'чтобы увидеть проверку.')
-                await self.alert(f'Нужна проверка Авито: {REASON_TEXT[status.value]}, {code}\n' + answered
+                await notify(f'Нужна проверка Авито: {REASON_TEXT[status.value]}, {code}\n' + answered
                                  + 'Автоматические запросы остановлены, повторов вслепую нет. ' + where
                                  + ' Пройдите её — бот сам увидит обычную выдачу и продолжит сбор, '
                                  'команды отправлять не нужно. Очередь Telegram работает.')
@@ -547,15 +577,15 @@ class Monitor:
             state = SourceState.NETWORK_UNAVAILABLE
             if status is FetchStatus.PARSE_CHANGED:
                 delay, state = max(900, delay), SourceState.PARSER_ERROR
-            server_until = time.time() + result.retry_after_sec if result.retry_after_sec else None
+            server_until = time.time() + result.retry_after_sec if result.retry_after_sec is not None else None
             until = max(time.time() + delay, server_until or 0)
-            changed = self.db.save_source_state(self.source_id, city, state, until, status.value,
+            changed = self.access.record(result, state, until, status.value,
                                                 result.http_status, server_until)
             saved = next(s for s in self.db.source_states(self.source_id) if s['city'] == city)
             self.verification.note_restriction(city, saved['since'], False)  # an error page proves nothing
             self.status = f'{state}: {STATE_TEXT[state]}'
             if changed:
-                await self.alert('Источник временно недоступен\n'
+                await notify('Источник временно недоступен\n'
                                  + ('Страница Авито не распознана.' if status is FetchStatus.PARSE_CHANGED
                                     else 'Ошибка сети или сервера.')
                                  + f' Следующая попытка после {_when(until)}, сбор продолжится сам.')
@@ -664,35 +694,43 @@ class Monitor:
     # ---------- verification ----------
 
     async def confirm_verification(self, result: FetchResult, page_url: str, states: list[dict]) -> None:
-        """A normal catalog in the loaded page ends a pending check; a server term still binds."""
+        """One transaction for the proven city's state, event, metrics and durable listings."""
+        feed = feed_url(result.city, self.cfg.feed)
+        states = [s for s in states if s['city'] == result.city]
+        if not states or not same_search(page_url, feed):
+            raise ValueError('Confirmation requires the exact pending catalog search')
         result.diagnostics.update(actual_mode='loaded_dom', is_warmup=False,
                                   browser_engine=getattr(self.scraper, 'browser_engine', None),
                                   browser_channel=getattr(self.scraper, 'browser_channel', None),
                                   fetch_mode=getattr(self.scraper, 'fetch_mode', None),
                                   run_id=getattr(self.scraper, 'run_id', None))
-        now = time.time()
-        # The confirmed page is an observation: the next scheduled check keeps the normal interval.
-        self.db.set(f'next_poll:{self.source_id}', str(now + self.next_delay()))
-        terms = {s['city']: s['server_until'] for s in states if (s.get('server_until') or 0) > now}
-        self._event('verification_confirmed', city=result.city, result=result.status.value,
-                    cities=[s['city'] for s in states], server_term=bool(terms))
-        # Same feed key as automatic polling, so the confirmed page is not mistaken for a new baseline.
-        feed = feed_url(result.city, self.cfg.feed)
-        same_feed = urlparse(page_url).path.strip('/') == urlparse(feed).path.strip('/')
-        await self._handle(result, feed if same_feed else page_url, operation='verification',
-                           announce=not terms)
-        for state in states:
-            if state['city'] in terms:
-                self.db.save_source_state(self.source_id, state['city'], SourceState.RATE_LIMITED,
-                                          terms[state['city']], 'verification passed; Retry-After',
-                                          state['http_status'], terms[state['city']])
-            else:
-                self.db.save_source_state(self.source_id, state['city'], SourceState.AVAILABLE)
+        now, alerts = time.time(), []
+        terms = [s['server_until'] for s in states if (s.get('server_until') or 0) > now]
+        memory = self.status, self.last_ok, self.last_items, self.collection_confirmed, self._errors.copy()
+        try:
+            with self.db.atomic():
+                self.db.set(f'next_poll:{self.source_id}', str(now + self.next_delay()))
+                # All notifications are buffered: no external await/yield inside this transaction.
+                await self._handle(result, feed, operation='verification', announce=not terms, alerts=alerts)
+                self.access.confirm(result.city, now)
+                self.db.record_event('verification_confirmed', source_id=self.source_id,
+                                     city=result.city, result=result.status.value,
+                                     cities=[result.city], server_term=bool(terms))
+        except BaseException:
+            self.status, self.last_ok, self.last_items, self.collection_confirmed, self._errors = memory
+            raise
+        if hasattr(self.scraper, 'collector'):
+            self.scraper.collector.consumed()
         if terms:
-            await self.alert('Проверка пройдена\nОбычная выдача подтверждена по открытой странице. Авито указал срок '
-                             f'до {_when(max(terms.values()))} — сбор продолжится сам после него.')
+            alerts.append('Проверка пройдена\nОбычная выдача подтверждена по открытой странице. Авито указал срок '
+                          f'до {_when(max(terms))} — сбор продолжится сам после него.')
         self.refresh_status()
         self._wake.set()
+        for text in alerts:
+            try:
+                await self.alert(text)
+            except Exception:
+                log.exception('Cannot announce committed verification')
 
     async def open_verification(self) -> str:
         async with self._source_lock:
@@ -722,9 +760,8 @@ class Monitor:
         self.db.set(f'next_poll:{self.source_id}', str(time.time() + self.next_delay()))
         await self._handle(result, feed_url(city, self.cfg.feed), operation='manual')
         if result.status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
-            # No server term is active (checked above); a normal catalog ends every stop.
-            for state in waiting:
-                self.db.save_source_state(self.source_id, state['city'], SourceState.AVAILABLE)
+            # This catalog proves access only for its own city.
+            self.access.confirm(city, time.time())
             self._wake.set()
             return 'Страница открыта, обычная выдача подтверждена. Сбор продолжается.'
         if result.status is FetchStatus.RATE_LIMITED:
@@ -752,9 +789,17 @@ class Monitor:
                  f'Фактический интервал: {self.last_interval_sec:.1f} с' if self.last_interval_sec else 'Фактический интервал: ещё не измерен']
         if hasattr(self.scraper, 'browser_engine'):
             lines.append(f'Браузер: {self.scraper.browser_engine}/{self.scraper.browser_channel}, '
-                         f'режим: {self.scraper.fetch_mode}'
+                         f'режим: {self.scraper.fetch_mode}; сессия: {getattr(self.scraper, "session_mode", "managed")}'
+                         + (f'; ошибка сессии: {html.escape(str(self.scraper.session_manager.session.last_error))}'
+                            if getattr(getattr(getattr(self.scraper, 'session_manager', None), 'session', None),
+                                       'last_error', None) else '')
                          + (f'; перезапуск: {html.escape(self.source_down)}' if self.source_down else ''))
+        if getattr(self.scraper, 'session_mode', None) in ('cdp_attach', 'chrome_extension'):
+            lines.append('Подключённый Chrome: маршрут неизвестен; DirectProxy бота не применяется')
         for s in states:
+            facts = self.access.get(s['city'])
+            lines.append(f"{s['city']}: проверка требуется={facts.verification_required}, "
+                         f"подтверждена={facts.verification_confirmed}; серверный срок={_when(s.get('server_until'))}")
             if self._restricting(s, now):
                 lines.append(html.escape(f"{s['city']}: {self.restriction_label(s)} ({s['state']}, {s['reason']})"))
                 lines.extend(html.escape('  ' + line) for line in self.restriction_details(s, now))

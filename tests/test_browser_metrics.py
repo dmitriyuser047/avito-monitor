@@ -133,6 +133,7 @@ def test_manual_verification_and_resume_share_restrictions_and_metrics(tmp_path,
         # A server-provided Retry-After remains binding even for a manual captcha check.
         with db.conn:
             db.conn.execute('UPDATE source_state SET next_allowed_at=0, server_until=0')
+            db.conn.execute("UPDATE access_status SET data_json=json_set(data_json,'$.rate_limit_until',0)")
         before = source.page.goto.await_count
         assert not await mon.poll_once()  # at most a local DOM read, never a navigation
         assert source.page.goto.await_count == before

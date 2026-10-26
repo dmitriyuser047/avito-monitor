@@ -41,17 +41,28 @@ async def run() -> None:
             db.set('owner_id', str(tg.owner_id))
         scraper = Scraper(cfg.data_dir / 'browser-profile', None, cfg.headless,
                           cfg.save_debug_html, cfg.debug_html_retention_hours,
-                          cfg.browser_engine, cfg.fetch_mode, cfg.browser_channel)
+                          cfg.browser_engine, cfg.fetch_mode, cfg.browser_channel,
+                          session_mode=cfg.browser_session_mode, cdp_endpoint=cfg.cdp_endpoint,
+                          cdp_profile_dir=cfg.cdp_profile_dir, startup_diagnostics=cfg.startup_diagnostics,
+                          extension_bridge_port=cfg.extension_bridge_port)
         async def console_alert(text):
             log.info('[alert] %s', text)
         async def start_source():
             # Used at startup and by every automatic browser restart; starting makes no request to Avito.
             nonlocal proxy
-            if cfg.direct_interface and proxy is None:
+            if proxy and not proxy.health()['connected']:
+                await proxy.stop()
+                proxy = None
+            if cfg.browser_session_mode == 'managed' and cfg.direct_interface and proxy is None:
                 candidate = DirectProxy(cfg.direct_interface)
-                await candidate.start()
+                try:
+                    await candidate.start()
+                except BaseException:
+                    await candidate.stop()
+                    raise
                 proxy = candidate
                 scraper.proxy_url = proxy.url
+                scraper.proxy_health = proxy.health
             await scraper.start()
         monitor = Monitor(cfg, db, scraper, tg.alert if tg else console_alert,
                           recipients=tg.recipients if tg else None, start_source=start_source)

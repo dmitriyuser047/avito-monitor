@@ -95,12 +95,41 @@ INSPECT_FN = f"""(root) => {{
     blocked, challenge, restriction_reason: reason}};
 }}"""
 
+# Size of one search document from Resource/Navigation Timing: works without CDP (extension mode).
+# transferSize is the encoded body plus headers (Chrome reports a fixed 300 bytes for them);
+# 0 means the browser did not expose the size.
+DOCUMENT_SIZE_FN = """(entry) => entry
+  ? {transfer: entry.transferSize, encoded: entry.encodedBodySize, decoded: entry.decodedBodySize} : null"""
+
+CURRENT_JS = (f'() => ({{...({INSPECT_FN})(document), document_started_at: performance.timeOrigin / 1000, '
+              f'document: ({DOCUMENT_SIZE_FN})(performance.getEntriesByType("navigation")[0])}})')
+
 LIGHT_JS = f"""async ([url, wantHtml]) => {{
+  // The observer still sees the entry when the page's timing buffer is full. The page buffer is never
+  // cleared. Fetches from an isolated world (patchright) get no entry: only the decoded size is known.
+  const target = new URL(url, location.href).href;
+  const buffered = () => performance.getEntriesByName(target).filter(e => e.initiatorType === 'fetch');
+  const before = buffered().length;
+  let entry = null;
+  const observer = new PerformanceObserver(list => {{
+    for (const e of list.getEntries()) if (e.name === target && e.initiatorType === 'fetch') entry = e;
+  }});
+  try {{ observer.observe({{type: 'resource'}}); }} catch (_) {{}}
   const r = await fetch(url, {{credentials: 'include', cache: 'no-store',
     signal: AbortSignal.timeout(25000), headers: {{'accept': 'text/html,application/xhtml+xml'}}}});
   const meta = {{status: r.status, url: r.url, retry_after: r.headers.get('retry-after')}};
+  let text = null;
+  try {{ text = await r.text(); }} catch (_) {{}}
+  for (const deadline = Date.now() + 1000; !entry && Date.now() < deadline;) {{
+    const list = buffered();
+    if (list.length > before) entry = list[list.length - 1];
+    else await new Promise(resolve => setTimeout(resolve, 25));
+  }}
+  observer.disconnect();
+  meta.document = ({DOCUMENT_SIZE_FN})(entry) || (text === null ? null : {{decoded: new Blob([text]).size}});
+  if (text === null) return {{...meta, items: []}};
   let doc;
-  try {{ doc = new DOMParser().parseFromString(await r.text(), 'text/html'); }}
+  try {{ doc = new DOMParser().parseFromString(text, 'text/html'); }}
   catch (_) {{ return {{...meta, items: []}}; }}
   const out = ({INSPECT_FN})(doc);
   // Debug output deliberately excludes scripts, form values, cookies and full HTML.
@@ -126,9 +155,18 @@ def retry_after_seconds(value: str | None, now: float | None = None) -> float | 
             return None
 
 
+def document_sizes(document) -> dict:
+    """On-wire and decoded size of the search document; unknown stays None, never 0."""
+    def size(name):
+        value = document.get(name) if isinstance(document, dict) else None
+        return int(value) if isinstance(value, (int, float)) and math.isfinite(value) and value > 0 else None
+    return dict(document_bytes=size('transfer'), document_decoded_bytes=size('decoded'))
+
+
 def parse_result(raw: dict, source_id: str, city: str) -> FetchResult:
     code = raw.get('status')
-    diagnostics = {'catalog': bool(raw.get('catalog')), 'raw_count': len(raw.get('items', []))}
+    diagnostics = {'catalog': bool(raw.get('catalog')), 'raw_count': len(raw.get('items', [])),
+                   **document_sizes(raw.get('document'))}
     if code == 429:
         diagnostics['verification_page'] = bool(raw.get('challenge') or raw.get('blocked'))
     result = FetchResult(FetchStatus.PARSE_CHANGED, [], source_id, city, time.time(), code,
@@ -190,8 +228,11 @@ class Scraper:
                  browser_engine: str = 'playwright', fetch_mode: str = 'light_fetch',
                  browser_channel: str = 'chrome', *, session_mode: str = 'managed',
                  cdp_endpoint: str = 'http://127.0.0.1:9222', cdp_profile_dir: Path | None = None,
-                 startup_diagnostics: bool = False, extension_bridge_port: int = 9233):
+                 startup_diagnostics: bool = False, extension_bridge_port: int = 9233,
+                 source_id: str | None = None):
         self.profile_dir, self.proxy_url, self.headless = profile_dir, proxy_url, headless
+        if source_id:
+            self.source_id = source_id
         if browser_engine not in ('playwright', 'patchright'):
             raise ValueError('Unknown browser engine')
         if fetch_mode not in ('light_fetch', 'page_navigation'):
@@ -460,8 +501,7 @@ class Scraper:
         url = url or (self.page.url if self.page else '')
         try:
             # Reads the document already in the page; never a network request.
-            raw = await asyncio.wait_for(self.page.evaluate(
-                f'() => ({{...({INSPECT_FN})(document), document_started_at: performance.timeOrigin / 1000}})'), 15)
+            raw = await asyncio.wait_for(self.page.evaluate(CURRENT_JS), 15)
             raw.update(status=code, retry_after=retry_after)
             result = parse_result(raw, self.source_id, _city(url))
             result.diagnostics['document_started_at'] = raw.get('document_started_at')

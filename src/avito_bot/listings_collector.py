@@ -40,7 +40,9 @@ class ListingsCollector:
             began = result.diagnostics.get('document_started_at')
             if (result.status not in (FetchStatus.OK, FetchStatus.NO_RESULTS)
                     or began is not None and 0 <= time.time() - began <= self.max_dom_age):
-                result.diagnostics.update(actual_mode='loaded_dom', is_warmup=False)
+                # The document was loaded before this check; reading it transferred nothing.
+                result.diagnostics.update(actual_mode='loaded_dom', is_warmup=False,
+                                          document_bytes=None, document_decoded_bytes=None)
                 return scraper._measured(result, measurement, 'loaded_dom')
         result = await scraper.fetch(search.url)
         self._consumed = self._document()

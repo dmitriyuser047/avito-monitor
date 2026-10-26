@@ -183,18 +183,52 @@ class Monitor:
 
     def photos_allowed(self) -> bool:
         """Photo requests go to Avito too: only after a confirmed catalog in this run and with no restriction."""
-        if self.source_down or not self.collection_confirmed:
+        if self.source_down or not self.collection_confirmed or self.traffic_exhausted():
             return False
         now = time.time()
         return not any(self._restricting(s, now) for s in self.db.source_states(self.source_id))
+
+    # ---------- daily traffic limit ----------
+
+    def _traffic_key(self, now: float | None = None) -> str:
+        day = datetime.fromtimestamp(time.time() if now is None else now).date().isoformat()
+        return f'traffic:{self.source_id}:{day}'
+
+    def traffic_today(self, now: float | None = None) -> int:
+        return int(self.db.get(self._traffic_key(now)) or 0)
+
+    def add_traffic(self, size) -> None:
+        """Bytes sent through the source's route today: pages, restricted answers and photos alike."""
+        if isinstance(size, (int, float)) and size > 0:
+            self.db.set(self._traffic_key(), str(self.traffic_today() + int(size)))
+
+    def traffic_exhausted(self, now: float | None = None) -> bool:
+        limit = getattr(self.cfg, 'daily_traffic_limit_mb', 0) * 1_000_000
+        return bool(limit) and self.traffic_today(now) >= limit
+
+    async def _traffic_alert(self) -> None:
+        key = f'traffic_alert:{self._traffic_key()}'
+        if self.db.get(key):
+            return
+        self.db.set(key, '1')  # once a day, even if Telegram fails
+        self._event('traffic_limit_reached', result=str(self.traffic_today()))
+        await self.alert(f'Дневной лимит трафика исчерпан\n'
+                         f'Сегодня через прокси прошло {self.traffic_today() / 1e6:.0f} МБ '
+                         f'(лимит {self.cfg.daily_traffic_limit_mb:g} МБ). '
+                         'Сбор на паузе до полуночи и продолжится сам. Лимит: DAILY_TRAFFIC_LIMIT_MB.')
 
     def budget(self) -> float:
         start, end = self.cfg.night_hours
         hour = datetime.now().hour
         night = start <= hour < end if start <= end else hour >= start or hour < end
         configured = self.cfg.night_requests_per_minute if night else self.cfg.requests_per_minute
-        learned = self.db.get('rpm')
+        learned = self.db.get(self._rpm_key)
         return min(configured, float(learned)) if learned else configured
+
+    @property
+    def _rpm_key(self) -> str:
+        # A budget lowered on the home IP must not cap a proxy route (and vice versa).
+        return 'rpm' if self.source_id == 'local_browser' else f'rpm:{self.source_id}'
 
     def delay(self) -> float:
         return 60 / max(self.budget(), .01)
@@ -209,10 +243,10 @@ class Monitor:
 
     def _slow_down(self) -> float | None:
         """Compatibility for existing saved limits; not a recovery mechanism."""
-        current = float(self.db.get('rpm') or self.cfg.requests_per_minute)
+        current = float(self.db.get(self._rpm_key) or self.cfg.requests_per_minute)
         lowered = max(1, current - 1)
         if lowered < current:
-            self.db.set('rpm', f'{lowered:g}')
+            self.db.set(self._rpm_key, f'{lowered:g}')
             return lowered
         return None
 
@@ -289,6 +323,8 @@ class Monitor:
             return f'RESTARTING: браузер перезапускается ({self.source_down})'
         if not self.db.subscriptions(only_enabled=True):
             return 'IDLE: нет активных запросов'
+        if self.traffic_exhausted(now):
+            return 'PAUSED: дневной лимит трафика исчерпан, сбор продолжится после полуночи'
         for state in self.db.source_states(self.source_id):
             if self._restricting(state, now):
                 return f"{state['state']}: {self.restriction_label(state)}"
@@ -325,6 +361,8 @@ class Monitor:
         stop = self._stop_reason(now)
         if stop:
             self.status = stop
+            if self.traffic_exhausted(now):
+                await self._traffic_alert()
             return False
         if float(self.db.get(f'next_poll:{self.source_id}') or 0) > now:
             return False
@@ -435,8 +473,11 @@ class Monitor:
         correlation_id = uuid.uuid4().hex[:12]
         diagnostic_names = ('browser_engine', 'browser_channel', 'fetch_mode', 'actual_mode', 'run_id',
                             'duration_sec', 'request_count', 'transferred_bytes', 'access_limited',
-                            'is_warmup', 'restriction_reason')
+                            'is_warmup', 'restriction_reason', 'document_bytes', 'document_decoded_bytes')
         diagnostics = {name: result.diagnostics.get(name) for name in diagnostic_names}
+        # The whole page load when CDP counted it, otherwise the search document alone.
+        self.add_traffic(diagnostics['transferred_bytes'] if diagnostics['transferred_bytes'] is not None
+                         else diagnostics['document_bytes'])
         context = dict(feed=self.cfg.feed, sections=self.cfg.sections,
                        subscriptions=[asdict(s) for s in self.db.subscriptions(only_enabled=True)],
                        city=self.cfg.city, rpm=self.cfg.requests_per_minute,
@@ -459,7 +500,7 @@ class Monitor:
         self._event('source_checked', correlation_id=correlation_id, city=city, result=status.value,
                     http_status=result.http_status, operation=operation, actual_mode=diagnostics['actual_mode'],
                     duration_sec=diagnostics['duration_sec'], request_count=diagnostics['request_count'],
-                    transferred_bytes=diagnostics['transferred_bytes'])
+                    transferred_bytes=diagnostics['transferred_bytes'], document_bytes=diagnostics['document_bytes'])
         if status in (FetchStatus.OK, FetchStatus.NO_RESULTS):
             self.status = f'{SourceState.AVAILABLE}: работает'
             self.collection_confirmed = True
@@ -796,6 +837,10 @@ class Monitor:
                          + (f'; перезапуск: {html.escape(self.source_down)}' if self.source_down else ''))
         if getattr(self.scraper, 'session_mode', None) in ('cdp_attach', 'chrome_extension'):
             lines.append('Подключённый Chrome: маршрут неизвестен; DirectProxy бота не применяется')
+        limit = getattr(self.cfg, 'daily_traffic_limit_mb', 0)
+        lines.append(f'Маршрут: {"внешний прокси" if getattr(self.cfg, "proxy_url", None) else "напрямую"}; '
+                     f'трафик сегодня: {self.traffic_today() / 1e6:.1f} МБ'
+                     + (f' из {limit:g} МБ' if limit else ' (без лимита)'))
         for s in states:
             facts = self.access.get(s['city'])
             lines.append(f"{s['city']}: проверка требуется={facts.verification_required}, "

@@ -39,12 +39,12 @@ async def run() -> None:
                 log.error('OWNER_ID must be configured before starting; use avito-setup')
                 raise SystemExit(78)
             db.set('owner_id', str(tg.owner_id))
-        scraper = Scraper(cfg.data_dir / 'browser-profile', None, cfg.headless,
+        scraper = Scraper(cfg.browser_profile_dir, cfg.proxy_url, cfg.headless,
                           cfg.save_debug_html, cfg.debug_html_retention_hours,
                           cfg.browser_engine, cfg.fetch_mode, cfg.browser_channel,
                           session_mode=cfg.browser_session_mode, cdp_endpoint=cfg.cdp_endpoint,
                           cdp_profile_dir=cfg.cdp_profile_dir, startup_diagnostics=cfg.startup_diagnostics,
-                          extension_bridge_port=cfg.extension_bridge_port)
+                          extension_bridge_port=cfg.extension_bridge_port, source_id=cfg.source_id)
         async def console_alert(text):
             log.info('[alert] %s', text)
         async def start_source():
@@ -70,7 +70,12 @@ async def run() -> None:
             tg.monitor = monitor
             # Reuse each listing image for multiple recipients without extra
             # requests. Respect the source safety gate on every recipient.
-            photo_cache = PhotoCache(scraper.download)
+            # Photos go through the same route and count towards the daily traffic limit.
+            async def counted_download(url):
+                photo = await scraper.download(url)
+                monitor.add_traffic(len(photo) if photo else 0)
+                return photo
+            photo_cache = PhotoCache(counted_download)
             # Delivery does not need a live browser; photo is optional.
             async def optional_photo(url):
                 # No photo request before the first confirmed catalog of this run (e.g. a fresh profile).

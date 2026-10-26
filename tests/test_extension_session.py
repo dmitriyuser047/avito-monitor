@@ -147,6 +147,9 @@ def test_real_extension_collects_in_existing_browser_and_disconnect_leaves_it_op
                 light=await scraper.fetch(URL)
                 assert light.status == FetchStatus.OK
                 assert light.diagnostics['actual_mode'] == 'light_fetch'
+                # Extension mode has no CDP; the document size still comes from Resource Timing.
+                assert light.diagnostics['transferred_bytes'] is None
+                assert light.diagnostics['document_decoded_bytes'] == len((fixtures/'catalog.html').read_bytes())
                 scraper.fetch_mode='page_navigation'
                 selected.update(name='challenge',status=429)
                 limited=await scraper.fetch(URL)

@@ -4,6 +4,7 @@ import os
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,6 +34,27 @@ def city_slug(text: str) -> str:
 
 def city_name(slug: str) -> str:
     return CITY_NAMES.get(slug, slug)
+
+
+def parse_proxy_url(url: str) -> dict:
+    """PROXY_URL → Playwright proxy settings. The password never leaves this dict (no repr, no logs)."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        raise ValueError('PROXY_URL must look like http://login:password@host:port') from None
+    if parts.scheme not in ('http', 'https', 'socks5') or not parts.hostname or not port:
+        raise ValueError('PROXY_URL must look like http://login:password@host:port (http, https or socks5)')
+    if parts.path not in ('', '/') or parts.query or parts.fragment:
+        raise ValueError('PROXY_URL must not contain a path or query')
+    if parts.scheme == 'socks5' and parts.username:
+        # Chromium cannot authenticate to SOCKS5; mobile ports serve HTTP on the same port.
+        raise ValueError('Chromium does not support SOCKS5 with a login; use http:// for PROXY_URL')
+    host = f'[{parts.hostname}]' if ':' in parts.hostname else parts.hostname
+    settings = {'server': f'{parts.scheme}://{host}:{port}'}
+    if parts.username:
+        settings.update(username=unquote(parts.username), password=unquote(parts.password or ''))
+    return settings
 
 
 def _load_dotenv(path: Path) -> None:
@@ -77,10 +99,22 @@ class Config:
     cdp_profile_dir: Path = field(default=ROOT / 'data/chrome-cdp-profile')
     startup_diagnostics: bool = False
     extension_bridge_port: int = 9233
+    proxy_url: str | None = field(default=None, repr=False)  # external proxy (mobile port, residential)
+    daily_traffic_limit_mb: float = 0  # pause collection for the rest of the day after this much; 0 disables
 
     @property
     def feed_url(self) -> str:
         return feed_url(self.city, self.feed)
+
+    @property
+    def source_id(self) -> str:
+        # A separate identity keeps restrictions and metrics of the proxy IP apart from the home IP.
+        return 'proxy_browser' if self.proxy_url else 'local_browser'
+
+    @property
+    def browser_profile_dir(self) -> Path:
+        # Cookies earned on the home IP are not carried to the proxy IP and back.
+        return self.data_dir / ('browser-profile-proxy' if self.proxy_url else 'browser-profile')
 
 
 def load_config() -> Config:
@@ -116,12 +150,22 @@ def load_config() -> Config:
         browser_engine=os.environ.get('BROWSER_ENGINE', 'playwright').strip().lower(),
         fetch_mode=os.environ.get('FETCH_MODE', 'light_fetch').strip().lower(),
         browser_channel=os.environ.get('BROWSER_CHANNEL', 'chrome').strip().lower(),
+        proxy_url=os.environ.get('PROXY_URL', '').strip() or None,
+        daily_traffic_limit_mb=float(os.environ.get('DAILY_TRAFFIC_LIMIT_MB', '0')),
     )
     for name, allowed in (('browser_session_mode', ('managed', 'cdp_attach', 'chrome_extension')), ('browser_engine', ('playwright', 'patchright')),
                           ('fetch_mode', ('light_fetch', 'page_navigation')),
                           ('browser_channel', ('chrome', 'chromium'))):
         if getattr(cfg, name) not in allowed:
             raise ValueError(f'{name} must be one of: {", ".join(allowed)}')
+    if cfg.proxy_url:
+        parse_proxy_url(cfg.proxy_url)
+        if cfg.browser_session_mode != 'managed':
+            raise ValueError('PROXY_URL works only with BROWSER_SESSION_MODE=managed')
+        if cfg.direct_interface:
+            raise ValueError('Use either PROXY_URL or DIRECT_INTERFACE, not both')
+    if not math.isfinite(cfg.daily_traffic_limit_mb) or cfg.daily_traffic_limit_mb < 0:
+        raise ValueError('DAILY_TRAFFIC_LIMIT_MB must be 0 (off) or positive')
     if not 1024 <= cfg.extension_bridge_port <= 65535:
         raise ValueError('EXTENSION_BRIDGE_PORT must be 1024–65535')
     for name in ('requests_per_minute', 'night_requests_per_minute', 'cooldown_seconds', 'max_backoff_seconds',

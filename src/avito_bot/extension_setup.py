@@ -9,7 +9,7 @@ from .extension_session import pairing_token
 
 
 def prepare_extension(data_dir: Path, port=9233):
-    from .scraper import INSPECT_FN, LIGHT_JS
+    from .scraper import CURRENT_JS, LIGHT_JS
     directory = data_dir / 'chrome-extension'
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory.chmod(0o700)
@@ -22,7 +22,7 @@ def prepare_extension(data_dir: Path, port=9233):
         f'export const TOKEN = {json.dumps(token)};\n')
     (directory / 'settings.js').chmod(0o600)
     (directory / 'inspector.js').write_text(
-        f'export const inspectDocument = () => ({{...({INSPECT_FN})(document), document_started_at: performance.timeOrigin / 1000}});\n'
+        f'export const inspectDocument = {CURRENT_JS};\n'
         f'export const fetchDocument = {LIGHT_JS};\n')
     return directory
 

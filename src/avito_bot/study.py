@@ -25,13 +25,13 @@ def begin_study(db: DB, cfg, hours: float = 24, now: float | None = None) -> int
     if not math.isfinite(hours) or hours <= 0:
         raise ValueError('Study duration must be positive')
     now = time.time() if now is None else now
-    if db.conn.execute("SELECT 1 FROM studies WHERE source_id='local_browser' AND status='running'").fetchone():
+    if db.conn.execute("SELECT 1 FROM studies WHERE source_id=? AND status='running'", (cfg.source_id,)).fetchone():
         raise ValueError('A local study is already running; use avito-study report')
     if not db.subscriptions(only_enabled=True):
         raise ValueError('At least one active subscription is required')
     with db.conn:
         cur = db.conn.execute('INSERT INTO studies(source_id,started_at,ends_at,filters_json) VALUES (?,?,?,?)',
-                              ('local_browser', now, now + hours * 3600, json.dumps(filters_for(cfg,db),ensure_ascii=False)))
+                              (cfg.source_id, now, now + hours * 3600, json.dumps(filters_for(cfg,db),ensure_ascii=False)))
     return cur.lastrowid
 
 

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .config import parse_proxy_url
 from .runtime import InstanceLock
 
 TAB_NAME = 'avito-monitor-dedicated-v3'
@@ -127,7 +128,7 @@ class ManagedBrowserSession:
             self.pw = await api.async_playwright().start()
             self.ctx = await self.pw.chromium.launch_persistent_context(
                 str(self.user_data_dir), channel=self.channel, headless=self.headless, timeout=30000,
-                proxy={'server': self.proxy_url} if self.proxy_url else None,
+                proxy=parse_proxy_url(self.proxy_url) if self.proxy_url else None,
                 locale='ru-RU', timezone_id='Europe/Moscow', no_viewport=True,
                 args=['--window-size=1400,900', '--no-first-run', '--disable-session-crashed-bubble'])
             self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()

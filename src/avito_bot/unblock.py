@@ -17,7 +17,7 @@ async def run() -> None:
     db = DB(cfg.data_dir / 'bot.sqlite3')
     proxy, scraper = None, None
     try:
-        states = db.source_states('local_browser')
+        states = db.source_states(cfg.source_id)
         for s in states:
             if s['state'] != SourceState.AVAILABLE:
                 print(f"Сохранённое состояние {s['city']}: {s['state']} ({s['reason']}), "
@@ -28,11 +28,13 @@ async def run() -> None:
         if cfg.browser_session_mode == 'managed' and cfg.direct_interface:
             proxy = DirectProxy(cfg.direct_interface)
             await proxy.start()
-        scraper = Scraper(cfg.data_dir / 'browser-profile', proxy.url if proxy else None, headless=False,
+        # The check must be passed from the same IP and profile the bot collects with.
+        scraper = Scraper(cfg.browser_profile_dir, proxy.url if proxy else cfg.proxy_url, headless=False,
                           browser_engine=cfg.browser_engine, fetch_mode=cfg.fetch_mode,
                           browser_channel=cfg.browser_channel, session_mode=cfg.browser_session_mode,
                           cdp_endpoint=cfg.cdp_endpoint, cdp_profile_dir=cfg.cdp_profile_dir,
-                          startup_diagnostics=cfg.startup_diagnostics, extension_bridge_port=cfg.extension_bridge_port)
+                          startup_diagnostics=cfg.startup_diagnostics, extension_bridge_port=cfg.extension_bridge_port,
+                          source_id=cfg.source_id)
         await scraper.start()
         await scraper.set_window('normal')
         waiting = next((s['city'] for s in states if s['state'] in USER_STATES), cfg.city)

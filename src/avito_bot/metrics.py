@@ -263,18 +263,65 @@ def availability_report(conn, since: float = 0, until: float | None = None) -> d
                'Traffic counts collection-time page requests only; bytes are approximate.'])
 
 
+def byte_stats(values):
+    values = [v for v in values if valid_measurement(v) and v > 0]
+    if not values:
+        return None
+    return dict(distribution(values), mean=round(sum(values) / len(values)))
+
+
+def traffic_report(conn, since=0, until=1e20, interval_sec=300):
+    """Bytes per search request by mechanism, and the monthly volume one search costs at a given interval.
+
+    document_bytes is the search document alone (headers + encoded body, as a proxy bills it, minus TLS
+    overhead); page_bytes is everything the browser loaded during the check, known only with CDP."""
+    columns = {r[1] for r in conn.execute('PRAGMA table_info(fetch_metrics)')}
+    document = 'document_bytes' if 'document_bytes' in columns else 'NULL'
+    decoded = 'document_decoded_bytes' if 'document_decoded_bytes' in columns else 'NULL'
+    groups = {}
+    # The home IP and a proxy route are separate sources: their costs are never averaged together.
+    for source, engine, mode, status, document_bytes, decoded_bytes, page_bytes, requests in conn.execute(
+            f'SELECT source_id,browser_engine,actual_mode,status,{document},{decoded},transferred_bytes,request_count '
+            'FROM fetch_metrics WHERE fetched_at>=? AND fetched_at<?', (since, until)):
+        groups.setdefault((source, engine, mode), []).append(
+            (status, document_bytes, decoded_bytes, page_bytes, requests))
+    checks_per_month = 30 * 86400 / interval_sec
+    result = []
+    for (source, engine, mode), rows in sorted(groups.items(), key=lambda kv: tuple(str(k) for k in kv[0])):
+        doc = byte_stats(r[1] for r in rows)
+        page = byte_stats(r[3] for r in rows)
+        # Restricted answers are billed too, so the projection averages over every check with a size.
+        per_check = (page or doc or {}).get('mean')
+        result.append(dict(
+            source_id=source, browser_engine=engine, actual_mode=mode, checks=len(rows),
+            restricted_checks=sum(r[0] in RESTRICTED for r in rows),
+            document_bytes=doc, document_decoded_bytes=byte_stats(r[2] for r in rows),
+            successful_document_bytes=byte_stats(r[1] for r in rows if r[0] in SUCCESS),
+            page_bytes=page, page_requests=byte_stats(r[4] for r in rows),
+            monthly_gb_per_search=round(per_check * checks_per_month / 1e9, 2) if per_check else None))
+    return dict(since=since, until=until, interval_sec=interval_sec, groups=result,
+                notes=['document_bytes: search document only, via Resource/Navigation Timing; Chrome counts headers as 300 bytes.',
+                       'page_bytes: all browser traffic during the check, measured via CDP (null in extension mode).',
+                       'monthly_gb_per_search uses page_bytes when known, else document_bytes; TLS adds a few percent.',
+                       'loaded_dom reads an already open page and transfers nothing.'])
+
+
 def main():
     parser = argparse.ArgumentParser()
     output = parser.add_mutually_exclusive_group()
     output.add_argument('--events', action='store_true', help='Export detection/delivery rows as CSV')
     output.add_argument('--compare', action='store_true', help='Aggregate four sequential engine/mode combinations')
     output.add_argument('--availability', action='store_true', help='Service uptime, source availability, delivery')
+    output.add_argument('--traffic', action='store_true', help='Bytes per search request and monthly GB per search')
+    parser.add_argument('--interval', type=float, default=300, help='Check interval for --traffic projection, seconds')
     parser.add_argument('--since', type=float, default=0, help='Detection/fetch start, Unix seconds inclusive')
     parser.add_argument('--until', type=float, default=1e20, help='Detection/fetch end, Unix seconds exclusive')
     parser.add_argument('--db', type=Path, help='SQLite path (read-only)')
     args = parser.parse_args()
     if not math.isfinite(args.since) or not math.isfinite(args.until) or args.until <= args.since:
         parser.error('--since/--until must be finite and increasing')
+    if not math.isfinite(args.interval) or args.interval <= 0:
+        parser.error('--interval must be positive')
     path = (args.db or load_config().data_dir/'bot.sqlite3').resolve()
     with sqlite3.connect(path.as_uri()+'?mode=ro', uri=True) as conn:
         columns = {r[1] for r in conn.execute('PRAGMA table_info(fetch_metrics)')}
@@ -288,6 +335,8 @@ def main():
             writer.writerows(detection_events(conn, args.since, args.until))
         elif args.compare:
             print(json.dumps(comparison_report(conn, args.since, args.until), indent=2))
+        elif args.traffic:
+            print(json.dumps(traffic_report(conn, args.since, args.until, args.interval), indent=2))
         elif args.availability:
             if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='events'").fetchone():
                 parser.error('Database has no events yet; start the updated application to migrate it')
@@ -299,7 +348,8 @@ def main():
             fields = ['source_id', 'city', 'fetched_at', 'status', 'http_status', 'raw_count', 'matched_count',
                       'overlap_count', 'interval_sec', 'cooldown_until', 'browser_engine', 'browser_channel',
                       'fetch_mode', 'actual_mode', 'run_id', 'duration_sec', 'request_count', 'transferred_bytes',
-                      'access_limited', 'budget_rpm', 'comparison_context', 'operation', 'is_warmup', 'restriction_reason']
+                      'access_limited', 'budget_rpm', 'comparison_context', 'operation', 'is_warmup', 'restriction_reason',
+                      'document_bytes', 'document_decoded_bytes']
             select = ','.join(name for name in fields if name in columns)
             print(json.dumps([dict(row) for row in conn.execute(
                 f'SELECT {select} FROM fetch_metrics WHERE fetched_at>=? AND fetched_at<? ORDER BY id DESC LIMIT 1000',

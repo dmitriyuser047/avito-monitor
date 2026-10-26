@@ -36,15 +36,15 @@ def startup_report(cfg):
         conn = sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True)
         try:
             conn.row_factory = sqlite3.Row
-            rows = [dict(r) for r in conn.execute('SELECT * FROM source_state WHERE source_id=?', ('local_browser',))]
+            rows = [dict(r) for r in conn.execute('SELECT * FROM source_state WHERE source_id=?', (cfg.source_id,))]
             last = conn.execute('SELECT http_status FROM fetch_metrics WHERE source_id=? AND http_status IS NOT NULL '
-                                'ORDER BY id DESC LIMIT 1', ('local_browser',)).fetchone()
+                                'ORDER BY id DESC LIMIT 1', (cfg.source_id,)).fetchone()
             success = conn.execute("SELECT MAX(fetched_at) FROM fetch_metrics WHERE source_id=? AND status IN ('ok','no_results')",
-                                   ('local_browser',)).fetchone()[0]
-            next_poll = conn.execute('SELECT value FROM settings WHERE key=?', ('next_poll:local_browser',)).fetchone()
+                                   (cfg.source_id,)).fetchone()[0]
+            next_poll = conn.execute('SELECT value FROM settings WHERE key=?', (f'next_poll:{cfg.source_id}',)).fetchone()
             if conn.execute("SELECT 1 FROM sqlite_master WHERE name='access_status'").fetchone():
                 access = [json.loads(r[0]) for r in conn.execute('SELECT data_json FROM access_status WHERE source_id=?',
-                                                               ('local_browser',))]
+                                                               (cfg.source_id,))]
         except sqlite3.Error:
             pass
         finally:
@@ -54,7 +54,7 @@ def startup_report(cfg):
              'Chrome connection: ' + (sample.get('connection', 'unknown') if current else 'unknown'),
              'Profile: persistent',
              'Proxy: ' + ('unknown' if cfg.browser_session_mode in ('cdp_attach', 'chrome_extension')
-                          else 'enabled' if cfg.direct_interface else 'disabled'),
+                          else 'external' if cfg.proxy_url else 'enabled' if cfg.direct_interface else 'disabled'),
              'Network route: ' + (sample.get('route', 'unknown') if current else 'unknown'),
              'External IP: unknown',
              'Route mismatch: ' + ('DirectProxy configuration does not control attached Chrome'

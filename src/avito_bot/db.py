@@ -17,6 +17,7 @@ FETCH_DIAGNOSTIC_COLUMNS = {
     'access_limited': 'INTEGER', 'budget_rpm': 'REAL', 'comparison_context': 'TEXT',
     'operation': "TEXT NOT NULL DEFAULT 'automatic'",
     'is_warmup': 'INTEGER', 'restriction_reason': 'TEXT',
+    'document_bytes': 'INTEGER', 'document_decoded_bytes': 'INTEGER',
 }
 # Origin of a restriction: when it was first set, the HTTP answer and the server-given term.
 SOURCE_STATE_COLUMNS = {'since': 'REAL', 'http_status': 'INTEGER', 'server_until': 'REAL'}

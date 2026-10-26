@@ -287,6 +287,13 @@ def test_actual_engine_direct_proxy_and_request_api_on_loopback(tmp_path, monkey
                 assert result.status is FetchStatus.OK
                 assert result.diagnostics['request_count'] >= 1
                 assert result.diagnostics['transferred_bytes'] > 0
+                # The search document alone, without CDP. Chrome reports headers as a fixed 300 bytes.
+                assert result.diagnostics['document_decoded_bytes'] == len((FIXTURES/'catalog.html').read_bytes())
+                if engine == 'patchright' and result.diagnostics['actual_mode'] == 'light_fetch':
+                    # An isolated-world fetch has no timing entry; CDP still counts its bytes.
+                    assert result.diagnostics['document_bytes'] is None
+                else:
+                    assert result.diagnostics['document_bytes'] > result.diagnostics['document_decoded_bytes']
             assert await scraper.download(f'https://fixture.test:{port}/photo') == b'photo'
             assert received.count('/kazan/catalog') == 3 and received.count('/photo') == 1
         finally:

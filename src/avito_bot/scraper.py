@@ -190,7 +190,7 @@ class Scraper:
                  browser_engine: str = 'playwright', fetch_mode: str = 'light_fetch',
                  browser_channel: str = 'chrome', *, session_mode: str = 'managed',
                  cdp_endpoint: str = 'http://127.0.0.1:9222', cdp_profile_dir: Path | None = None,
-                 startup_diagnostics: bool = False):
+                 startup_diagnostics: bool = False, extension_bridge_port: int = 9233):
         self.profile_dir, self.proxy_url, self.headless = profile_dir, proxy_url, headless
         if browser_engine not in ('playwright', 'patchright'):
             raise ValueError('Unknown browser engine')
@@ -200,9 +200,11 @@ class Scraper:
             raise ValueError('Unknown browser channel')
         self.browser_engine, self.fetch_mode, self.browser_channel = browser_engine, fetch_mode, browser_channel
         self.session_mode = session_mode
+        if session_mode == 'chrome_extension':
+            self.browser_engine = 'chrome_extension'
         self.session_manager = BrowserSessionManager(
             profile_dir, mode=session_mode, engine=browser_engine, channel=browser_channel,
-            headless=headless, proxy_url=proxy_url, cdp_endpoint=cdp_endpoint, cdp_profile_dir=cdp_profile_dir)
+            headless=headless, proxy_url=proxy_url, cdp_endpoint=cdp_endpoint, cdp_profile_dir=cdp_profile_dir, extension_bridge_port=extension_bridge_port)
         self.user_data_dir = self.session_manager.session.user_data_dir
         self.page_lock = self.session_manager.session.lock
         self.diagnostics = StartupDiagnostics(profile_dir.parent / 'startup-diagnostics.json', startup_diagnostics)
@@ -351,7 +353,7 @@ class Scraper:
         return result
 
     async def set_window(self, state: str) -> None:
-        if self.session_mode == 'cdp_attach' or self.headless or self.closed or not self.page:
+        if self.session_mode in ('cdp_attach', 'chrome_extension') or self.headless or self.closed or not self.page:
             return
         cdp = None
         try:

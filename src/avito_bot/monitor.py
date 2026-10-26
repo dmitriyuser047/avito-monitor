@@ -375,12 +375,13 @@ class Monitor:
         if self.source_down is None:
             if not getattr(self.scraper, 'closed', False):
                 return True
-            attached = getattr(self.scraper, 'session_mode', None) == 'cdp_attach'
-            reason = 'cdp_disconnected' if attached else 'browser_closed'
+            attached = getattr(self.scraper, 'session_mode', None) in ('cdp_attach', 'chrome_extension')
+            extension = getattr(self.scraper, 'session_mode', None) == 'chrome_extension'
+            reason = 'extension_disconnected' if extension else 'cdp_disconnected' if attached else 'browser_closed'
             self.source_failed(reason)
             self._event('source_failed', result=reason)
-            await self.alert(('Потеряно подключение к Chrome (CDP)\nПовторяю подключение автоматически. '
-                              'Запустите отдельный Chrome с прежним профилем и портом. '
+            await self.alert(('Потеряно подключение к Chrome\nПовторяю подключение автоматически. '
+                              'Проверьте подключение Chrome в /health. '
                               if attached else 'Браузер бота закрылся\nПерезапускаю его автоматически. ')
                              + 'Telegram и очередь работают; сохранённые ограничения Авито не сбрасываются.')
         if time.monotonic() < self._restart_at:
@@ -788,8 +789,8 @@ class Monitor:
                             if getattr(getattr(getattr(self.scraper, 'session_manager', None), 'session', None),
                                        'last_error', None) else '')
                          + (f'; перезапуск: {html.escape(self.source_down)}' if self.source_down else ''))
-        if getattr(self.scraper, 'session_mode', None) == 'cdp_attach':
-            lines.append('CDP: маршрут пользовательского Chrome неизвестен; DirectProxy бота не применяется')
+        if getattr(self.scraper, 'session_mode', None) in ('cdp_attach', 'chrome_extension'):
+            lines.append('Подключённый Chrome: маршрут неизвестен; DirectProxy бота не применяется')
         for s in states:
             facts = self.access.get(s['city'])
             lines.append(f"{s['city']}: проверка требуется={facts.verification_required}, "

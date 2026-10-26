@@ -50,15 +50,15 @@ def startup_report(cfg):
         finally:
             conn.close()
     current = sample and time.time() - sample.get('at', 0) < 15
-    lines = [f'Browser session: {cfg.browser_session_mode}', f'Browser engine: {cfg.browser_engine}',
+    lines = [f'Browser session: {cfg.browser_session_mode}', f'Browser engine: {"chrome_extension" if cfg.browser_session_mode == "chrome_extension" else cfg.browser_engine}',
              'Chrome connection: ' + (sample.get('connection', 'unknown') if current else 'unknown'),
              'Profile: persistent',
-             'Proxy: ' + ('unknown' if cfg.browser_session_mode == 'cdp_attach'
+             'Proxy: ' + ('unknown' if cfg.browser_session_mode in ('cdp_attach', 'chrome_extension')
                           else 'enabled' if cfg.direct_interface else 'disabled'),
              'Network route: ' + (sample.get('route', 'unknown') if current else 'unknown'),
              'External IP: unknown',
              'Route mismatch: ' + ('DirectProxy configuration does not control attached Chrome'
-                                  if cfg.browser_session_mode == 'cdp_attach' and cfg.direct_interface else 'unknown'),
+                                  if cfg.browser_session_mode in ('cdp_attach', 'chrome_extension') and cfg.direct_interface else 'unknown'),
              'Last HTTP status: ' + _value(last[0] if last else None),
              'Last successful catalog: ' + _at(success),
              'Previous restriction restored: ' + _value(sample.get('previous_restriction_restored')),

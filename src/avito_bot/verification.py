@@ -90,7 +90,7 @@ class VerificationCoordinator:
         matching = [s for s in pending if same_search(
             page_url, feed_url(s['city'], self.monitor.cfg.feed))]
         eligible = [s for s in matching if self._eligible(s)]
-        attached = getattr(scraper, 'session_mode', 'managed') == 'cdp_attach'
+        attached = getattr(scraper, 'session_mode', 'managed') in ('cdp_attach', 'chrome_extension')
         if not eligible and not (attached and matching):
             return False
         result = await scraper.read_current()

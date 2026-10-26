@@ -260,7 +260,11 @@ class AttachedChromeSession(ManagedBrowserSession):
 
 class BrowserSessionManager:
     def __init__(self, profile_dir: Path, *, mode='managed', engine='playwright', channel='chrome',
-                 headless=False, proxy_url=None, cdp_endpoint='http://127.0.0.1:9222', cdp_profile_dir=None):
+                 headless=False, proxy_url=None, cdp_endpoint='http://127.0.0.1:9222', cdp_profile_dir=None, extension_bridge_port=9233):
+        if mode == 'chrome_extension':
+            from .extension_session import ExtensionBrowserSession
+            self.session = ExtensionBrowserSession(profile_dir.parent / 'extension-bridge', extension_bridge_port)
+            return
         if mode not in ('managed', 'cdp_attach'):
             raise ValueError('Unknown browser session mode')
         self.session = (AttachedChromeSession(cdp_profile_dir or profile_dir.parent / 'chrome-cdp-profile',

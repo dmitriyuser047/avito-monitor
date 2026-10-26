@@ -43,7 +43,8 @@ async def run() -> None:
                           cfg.save_debug_html, cfg.debug_html_retention_hours,
                           cfg.browser_engine, cfg.fetch_mode, cfg.browser_channel,
                           session_mode=cfg.browser_session_mode, cdp_endpoint=cfg.cdp_endpoint,
-                          cdp_profile_dir=cfg.cdp_profile_dir, startup_diagnostics=cfg.startup_diagnostics)
+                          cdp_profile_dir=cfg.cdp_profile_dir, startup_diagnostics=cfg.startup_diagnostics,
+                          extension_bridge_port=cfg.extension_bridge_port)
         async def console_alert(text):
             log.info('[alert] %s', text)
         async def start_source():

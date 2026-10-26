@@ -32,7 +32,7 @@ async def run() -> None:
                           browser_engine=cfg.browser_engine, fetch_mode=cfg.fetch_mode,
                           browser_channel=cfg.browser_channel, session_mode=cfg.browser_session_mode,
                           cdp_endpoint=cfg.cdp_endpoint, cdp_profile_dir=cfg.cdp_profile_dir,
-                          startup_diagnostics=cfg.startup_diagnostics)
+                          startup_diagnostics=cfg.startup_diagnostics, extension_bridge_port=cfg.extension_bridge_port)
         await scraper.start()
         await scraper.set_window('normal')
         waiting = next((s['city'] for s in states if s['state'] in USER_STATES), cfg.city)

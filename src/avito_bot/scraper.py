@@ -256,6 +256,8 @@ class Scraper:
             self._final_url.clear()
             self.run_id = session.epoch
             self.navigation_generation = 0
+            if self.session_mode == 'chrome_extension':
+                self.page.listeners.clear()
             self.page.on('framenavigated', self._on_navigated)
             self.page.on('close', lambda *_: setattr(self, '_closed', True))
             await self._start_network_metrics()
@@ -265,8 +267,11 @@ class Scraper:
                                     if self.session_mode == 'managed' else 'unknown')
             if self.session_mode == 'managed':
                 await self.set_window('minimized')
-        except BaseException:
-            await self.stop()
+        except BaseException as exc:
+            if self.session_mode == 'chrome_extension' and isinstance(exc, TimeoutError):
+                self._closed = True
+            else:
+                await self.stop()
             raise
 
     def _on_navigated(self, frame) -> None:

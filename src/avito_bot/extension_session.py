@@ -92,8 +92,9 @@ class ExtensionContext:
 class ExtensionBrowserSession:
     mode = 'chrome_extension'
 
-    def __init__(self, directory: Path, port=9233):
+    def __init__(self, directory: Path, port=9233, connect_timeout=20):
         self.directory, self.port = directory, port
+        self.connect_timeout = connect_timeout
         self.user_data_dir = directory
         self.engine = 'chrome_extension'
         self.proxy_url = self.pw = None
@@ -107,25 +108,30 @@ class ExtensionBrowserSession:
         self._token = None
 
     async def start(self):
-        if self._runner:
-            raise RuntimeError('Extension bridge already started')
-        self.page, self.ctx = ExtensionPage(self), ExtensionContext(self)
-        self._token = pairing_token(self.directory)
-        app = web.Application(client_max_size=2_000_000)
-        app.router.add_get('/bridge', self._connect)
-        self._runner = web.AppRunner(app, access_log=None, shutdown_timeout=2)
+        # The user can press Connect at any time, including while Monitor is backing off.
+        # A pending connection is not a reason to destroy the local listener or an arriving session.
+        if not self._runner:
+            self.page, self.ctx = ExtensionPage(self), ExtensionContext(self)
+            self._token = pairing_token(self.directory)
+            app = web.Application(client_max_size=2_000_000)
+            app.router.add_get('/bridge', self._connect)
+            self._runner = web.AppRunner(app, access_log=None, shutdown_timeout=2)
+            try:
+                await self._runner.setup()
+                site = web.TCPSite(self._runner, '127.0.0.1', self.port)
+                await site.start()
+                if not self.port:
+                    self.port = site._server.sockets[0].getsockname()[1]
+            except BaseException as exc:
+                self.last_error = type(exc).__name__
+                await self.disconnect()
+                raise
         try:
-            await self._runner.setup()
-            site = web.TCPSite(self._runner, '127.0.0.1', self.port)
-            await site.start()
-            if not self.port:
-                self.port = site._server.sockets[0].getsockname()[1]
-            await asyncio.wait_for(self._ready.wait(), 20)
+            await asyncio.wait_for(self._ready.wait(), self.connect_timeout)
             self.last_error = None
-        except BaseException as exc:
-            self.last_error = 'extension_not_connected' if isinstance(exc, TimeoutError) else type(exc).__name__
-            await self.disconnect()
-            raise
+        except TimeoutError:
+            self.last_error = 'extension_not_connected'
+            raise  # Keep listening; explicit disconnect/shutdown owns listener cleanup.
 
     async def attach(self):
         await self.start()

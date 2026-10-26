@@ -104,11 +104,16 @@ def test_extension_cannot_send_arbitrary_evaluation_or_external_navigation(tmp_p
 def test_real_extension_collects_in_existing_browser_and_disconnect_leaves_it_open(tmp_path):
     async def scenario():
         from playwright.async_api import async_playwright
-        extension=prepare_extension(tmp_path,9233)
+        scraper=Scraper(tmp_path/'p',None,session_mode='chrome_extension',extension_bridge_port=0)
+        session=scraper.session_manager.session
+        session.connect_timeout=.05
+        with pytest.raises(TimeoutError):
+            await scraper.start()
+        session.connect_timeout=20
+        extension=prepare_extension(tmp_path,session.port)
         async with async_playwright() as driver:
             ctx=await driver.chromium.launch_persistent_context(str(tmp_path/'test-chrome'),headless=True,
                 channel='chromium',args=[f'--disable-extensions-except={extension}',f'--load-extension={extension}'])
-            scraper=Scraper(tmp_path/'p',None,session_mode='chrome_extension')
             requests=[]
             fixtures=Path(__file__).parent/'fixtures'
             selected={'name':'catalog','status':200}
@@ -166,4 +171,37 @@ def test_real_extension_collects_in_existing_browser_and_disconnect_leaves_it_op
                 if not start.done():start.cancel()
                 await asyncio.gather(start,return_exceptions=True)
                 await ctx.close()
+    asyncio.run(scenario())
+
+
+def test_late_extension_connection_survives_startup_timeout_and_is_adopted(tmp_path):
+    async def scenario():
+        from avito_bot.config import load_config
+        from avito_bot.db import DB
+        from avito_bot.monitor import Monitor
+        scraper=Scraper(tmp_path/'p',None,session_mode='chrome_extension',extension_bridge_port=0)
+        session=scraper.session_manager.session
+        session.connect_timeout=.05
+        with pytest.raises(TimeoutError):
+            await scraper.start()
+        assert session._runner is not None
+        cfg=load_config();cfg.data_dir=tmp_path
+        db=DB(tmp_path/'db')
+        monitor=Monitor(cfg,db,scraper,AsyncMock())
+        monitor.source_failed('startup timeout')
+        monitor._restart_at=asyncio.get_running_loop().time()+600
+        async with aiohttp.ClientSession() as client:
+            async with client.ws_connect(f'http://127.0.0.1:{session.port}/bridge',headers={'Origin':ORIGIN}) as ws:
+                await ws.send_json(dict(type='hello',token=pairing_token(tmp_path/'extension-bridge'),url=URL))
+                await session._ready.wait()
+                assert await monitor._ensure_browser()
+                assert session.connected and monitor.source_down is None
+                assert not scraper.closed and session._runner is not None
+                assert len(session.page.listeners['framenavigated']) == 1
+                # Re-adopting the connected extension is idempotent and creates no tab/request.
+                await scraper.start()
+                assert len(session.page.listeners['framenavigated']) == 1
+        await scraper.stop()
+        assert session._runner is None
+        db.close()
     asyncio.run(scenario())

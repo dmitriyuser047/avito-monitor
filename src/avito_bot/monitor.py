@@ -368,6 +368,10 @@ class Monitor:
         self.status = f'RESTARTING: браузер перезапускается ({reason})'
 
     async def _ensure_browser(self) -> bool:
+        extension = getattr(self.scraper, 'session_mode', None) == 'chrome_extension'
+        if (extension and self.source_down
+                and self.scraper.session_manager.session.connected):
+            self._restart_at = 0  # Adopt a late connection immediately, without dropping it.
         if (self.source_down is None and hasattr(self.scraper, 'proxy_health')
                 and not self.scraper.proxy_health()['connected']):
             self.source_failed('proxy_disconnected')
@@ -388,7 +392,8 @@ class Monitor:
             return False
         try:
             try:
-                await self.scraper.stop()
+                if not extension:
+                    await self.scraper.stop()
             except Exception:
                 log.debug('Browser stop before restart failed', exc_info=True)
             await self.start_source()

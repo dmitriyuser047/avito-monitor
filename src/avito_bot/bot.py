@@ -214,7 +214,11 @@ class TelegramBot:
 
     def _router(self) -> Router:
         r = Router()
-        allowed = F.from_user.func(lambda u: self.allowed(u.id))
+        async def allowed(event: Message | CallbackQuery) -> bool:
+            # Synchronous MagicFilter functions run in a worker thread; SQLite belongs
+            # to the event-loop thread that also handles invitations and subscriptions.
+            return event.from_user is not None and self.allowed(event.from_user.id)
+
         r.message.filter(allowed)
         r.callback_query.filter(allowed)
         is_owner = F.from_user.func(lambda u: u.id == self.owner_id)
